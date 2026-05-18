@@ -1,0 +1,16 @@
+# Xcode
+*.xcworkspace/xcuserdata
+*.xcodeproj/xcuserdata
+*.xcodeproj/project.xcworkspace/xcuserdata
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Build
+build/
+.build/
+
+# macOS
+.DS_Store
+**/.DS_Store
