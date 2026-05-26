@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct CatarApp: App {
+struct JammyApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

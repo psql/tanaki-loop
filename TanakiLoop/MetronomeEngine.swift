@@ -10,7 +10,7 @@ final class MetronomeEngine: ObservableObject, @unchecked Sendable {
     private let playerNode = AVAudioPlayerNode()
     private var accentBuffer: AVAudioPCMBuffer?
     private var tickBuffer: AVAudioPCMBuffer?
-    private let timerQueue = DispatchQueue(label: "com.catar.metronome", qos: .userInteractive)
+    private let timerQueue = DispatchQueue(label: "com.tanakiloop.metronome", qos: .userInteractive)
     private var metronomeTimer: DispatchSourceTimer?
     private var beatCount: Int = 0
 

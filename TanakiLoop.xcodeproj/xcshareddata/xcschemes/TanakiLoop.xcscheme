@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "CAAA0000000000000000EE01"
-               BuildableName = "Catar.app"
-               BlueprintName = "Catar"
-               ReferencedContainer = "container:Catar.xcodeproj">
+               BuildableName = "TanakiLoop.app"
+               BlueprintName = "TanakiLoop"
+               ReferencedContainer = "container:TanakiLoop.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -44,9 +44,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "CAAA0000000000000000EE01"
-            BuildableName = "Catar.app"
-            BlueprintName = "Catar"
-            ReferencedContainer = "container:Catar.xcodeproj">
+            BuildableName = "TanakiLoop.app"
+            BlueprintName = "TanakiLoop"
+            ReferencedContainer = "container:TanakiLoop.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -61,9 +61,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "CAAA0000000000000000EE01"
-            BuildableName = "Catar.app"
-            BlueprintName = "Catar"
-            ReferencedContainer = "container:Catar.xcodeproj">
+            BuildableName = "TanakiLoop.app"
+            BlueprintName = "TanakiLoop"
+            ReferencedContainer = "container:TanakiLoop.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

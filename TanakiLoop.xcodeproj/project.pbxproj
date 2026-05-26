@@ -7,24 +7,26 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		CAAA0000000000000000BB01 /* CatarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA01 /* CatarApp.swift */; };
+		CAAA0000000000000000BB01 /* TanakiLoopApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA01 /* TanakiLoopApp.swift */; };
 		CAAA0000000000000000BB02 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA02 /* ContentView.swift */; };
 		CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA03 /* MetronomeEngine.swift */; };
 		CAAA0000000000000000BB06 /* Recording.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA06 /* Recording.swift */; };
 		CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA07 /* RecordingEngine.swift */; };
 		CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA08 /* RecordingsListView.swift */; };
+		CAAA0000000000000000BB09 /* TrimView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA09 /* TrimView.swift */; };
 		CAAA0000000000000000BB04 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA04 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		CAAA0000000000000000AA01 /* CatarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CatarApp.swift; sourceTree = "<group>"; };
+		CAAA0000000000000000AA01 /* TanakiLoopApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TanakiLoopApp.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA03 /* MetronomeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetronomeEngine.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA06 /* Recording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recording.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA07 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA08 /* RecordingsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsListView.swift; sourceTree = "<group>"; };
+		CAAA0000000000000000AA09 /* TrimView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrimView.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA04 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		CAAA0000000000000000AA05 /* Catar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Catar.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CAAA0000000000000000AA05 /* TanakiLoop.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TanakiLoop.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -41,29 +43,30 @@
 		CAAA0000000000000000DD01 = {
 			isa = PBXGroup;
 			children = (
-				CAAA0000000000000000DD02 /* Catar */,
+				CAAA0000000000000000DD02 /* TanakiLoop */,
 				CAAA0000000000000000DD03 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		CAAA0000000000000000DD02 /* Catar */ = {
+		CAAA0000000000000000DD02 /* TanakiLoop */ = {
 			isa = PBXGroup;
 			children = (
-				CAAA0000000000000000AA01 /* CatarApp.swift */,
+				CAAA0000000000000000AA01 /* TanakiLoopApp.swift */,
 				CAAA0000000000000000AA02 /* ContentView.swift */,
 				CAAA0000000000000000AA03 /* MetronomeEngine.swift */,
 				CAAA0000000000000000AA06 /* Recording.swift */,
 				CAAA0000000000000000AA07 /* RecordingEngine.swift */,
 				CAAA0000000000000000AA08 /* RecordingsListView.swift */,
+				CAAA0000000000000000AA09 /* TrimView.swift */,
 				CAAA0000000000000000AA04 /* Assets.xcassets */,
 			);
-			path = Catar;
+			path = TanakiLoop;
 			sourceTree = "<group>";
 		};
 		CAAA0000000000000000DD03 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				CAAA0000000000000000AA05 /* Catar.app */,
+				CAAA0000000000000000AA05 /* TanakiLoop.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -71,9 +74,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		CAAA0000000000000000EE01 /* Catar */ = {
+		CAAA0000000000000000EE01 /* TanakiLoop */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = CAAA0000000000000000FF06 /* Build configuration list for PBXNativeTarget "Catar" */;
+			buildConfigurationList = CAAA0000000000000000FF06 /* Build configuration list for PBXNativeTarget "TanakiLoop" */;
 			buildPhases = (
 				CAAA0000000000000000CC01 /* Sources */,
 				CAAA0000000000000000CC02 /* Resources */,
@@ -83,9 +86,9 @@
 			);
 			dependencies = (
 			);
-			name = Catar;
-			productName = Catar;
-			productReference = CAAA0000000000000000AA05 /* Catar.app */;
+			name = TanakiLoop;
+			productName = TanakiLoop;
+			productReference = CAAA0000000000000000AA05 /* TanakiLoop.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -103,7 +106,7 @@
 					};
 				};
 			};
-			buildConfigurationList = CAAA0000000000000000FF05 /* Build configuration list for PBXProject "Catar" */;
+			buildConfigurationList = CAAA0000000000000000FF05 /* Build configuration list for PBXProject "TanakiLoop" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -116,7 +119,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				CAAA0000000000000000EE01 /* Catar */,
+				CAAA0000000000000000EE01 /* TanakiLoop */,
 			);
 		};
 /* End PBXProject section */
@@ -137,12 +140,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				CAAA0000000000000000BB01 /* CatarApp.swift in Sources */,
+				CAAA0000000000000000BB01 /* TanakiLoopApp.swift in Sources */,
 				CAAA0000000000000000BB02 /* ContentView.swift in Sources */,
 				CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */,
 				CAAA0000000000000000BB06 /* Recording.swift in Sources */,
 				CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */,
 				CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */,
+				CAAA0000000000000000BB09 /* TrimView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -273,7 +277,8 @@
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Catar records audio while the metronome plays.";
+				INFOPLIST_KEY_CFBundleDisplayName = "Tanaki Loop";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Tanaki Loop records audio for your looper.";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
@@ -283,7 +288,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.catar;
+				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.jammy;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -305,7 +310,8 @@
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Catar records audio while the metronome plays.";
+				INFOPLIST_KEY_CFBundleDisplayName = "Tanaki Loop";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Tanaki Loop records audio for your looper.";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
@@ -315,7 +321,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.catar;
+				PRODUCT_BUNDLE_IDENTIFIER = com.altbizney.jammy;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTS_MACCATALYST = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -327,7 +333,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		CAAA0000000000000000FF05 /* Build configuration list for PBXProject "Catar" */ = {
+		CAAA0000000000000000FF05 /* Build configuration list for PBXProject "TanakiLoop" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				CAAA0000000000000000FF01 /* Debug */,
@@ -336,7 +342,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		CAAA0000000000000000FF06 /* Build configuration list for PBXNativeTarget "Catar" */ = {
+		CAAA0000000000000000FF06 /* Build configuration list for PBXNativeTarget "TanakiLoop" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				CAAA0000000000000000FF03 /* Debug */,
