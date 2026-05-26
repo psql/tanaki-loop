@@ -1,5 +1,8 @@
 import AVFoundation
 import Accelerate
+import OSLog
+
+private let log = Logger(subsystem: "com.altbizney.jammy", category: "audio")
 
 final class JammyEngine: ObservableObject, @unchecked Sendable {
 
@@ -90,13 +93,15 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private func setupAudioSession() {
         #if os(iOS)
         let s = AVAudioSession.sharedInstance()
-        // .defaultToSpeaker is only safe when no external output device is present.
-        // USB audio interfaces route through their own headphone jack; forcing the
-        // built-in speaker would bypass the interface entirely.
         var opts: AVAudioSession.CategoryOptions = [.mixWithOthers]
         if !externalOutputConnected { opts.insert(.defaultToSpeaker) }
         try? s.setCategory(.playAndRecord, mode: .default, options: opts)
+        // Hint preferred format so inputNode.outputFormat has a valid value even
+        // when iOS can't identify the USB device's port type string ("Other").
+        try? s.setPreferredSampleRate(48_000)
+        try? s.setPreferredInputNumberOfChannels(2)
         try? s.setActive(true)
+        log.info("setupAudioSession: external=\(self.externalOutputConnected) sr=\(s.sampleRate) inputs=\(s.inputNumberOfChannels)")
         #endif
     }
 
@@ -169,29 +174,34 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         let inputNode = audioEngine.inputNode
         let hwFmt     = inputNode.outputFormat(forBus: 0)
 
-        // During USB hot-plug the port type string may be "Other" (unrecognised by
-        // iOS 26) and the format comes back with sampleRate=0/channelCount=0.
-        // Installing a tap on a zero format crashes with IsFormatSampleRateAndChannelCountValid.
-        // Back off and retry once the hardware has fully negotiated.
-        guard hwFmt.sampleRate > 0, hwFmt.channelCount > 0 else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.installInputTap()
-            }
+        // iOS 26 may report sampleRate=0/channelCount=0 for USB devices with an
+        // unrecognised port type string ("Other"). We must NOT pass a zero-SR
+        // format to installTap (crashes). Instead, build a valid format ourselves
+        // and let AVAudioEngine convert. Fallback: 48 kHz mono (RODE default).
+        let sr: Double            = hwFmt.sampleRate   > 0 ? hwFmt.sampleRate   : 48_000
+        let ch: AVAudioChannelCount = hwFmt.channelCount > 0 ? min(hwFmt.channelCount, 2) : 1
+        guard let tapFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: ch) else {
+            log.error("installInputTap: could not construct format sr=\(sr) ch=\(ch)")
             return
         }
+        captureFormat = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1)
 
-        captureFormat = AVAudioFormat(standardFormatWithSampleRate: hwFmt.sampleRate, channels: 1)
+        log.info("installInputTap: hwFmt sr=\(hwFmt.sampleRate) ch=\(hwFmt.channelCount) → tapFmt sr=\(sr) ch=\(ch)")
 
-        // Pass nil so AVAudioEngine owns the format decision; avoids a mismatch if the
-        // hardware reports a slightly different format than what we just read.
-        inputNode.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 512, format: tapFmt) { [weak self] buffer, _ in
             guard let self, let chData = buffer.floatChannelData else { return }
-            let n          = Int(buffer.frameLength)
-            let cap        = self.ringCapacity
-            let chCount    = Int(buffer.format.channelCount)
-            let ch0        = chData[0]
-            // Mix all input channels to mono (handles 1-mic phone, 2-mic USB interface, etc.)
-            let ch1        = chCount > 1 ? chData[1] : nil
+            let n       = Int(buffer.frameLength)
+            let cap     = self.ringCapacity
+            let chCount = Int(buffer.format.channelCount)
+            let ch0     = chData[0]
+            let ch1     = chCount > 1 ? chData[1] : nil
+
+            // Update captureFormat from the first real buffer in case the engine
+            // negotiated a different sample rate than what hwFmt reported.
+            if let cf = self.captureFormat, cf.sampleRate != buffer.format.sampleRate {
+                self.captureFormat = AVAudioFormat(standardFormatWithSampleRate: buffer.format.sampleRate, channels: 1)
+                log.info("captureFormat updated to \(buffer.format.sampleRate) Hz from first buffer")
+            }
 
             for i in 0..<n {
                 let s = ch1 != nil ? (ch0[i] + ch1![i]) * 0.5 : ch0[i]
@@ -199,15 +209,13 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
                 self.ringWritePos += 1
             }
 
-            // FFT at ~30 fps using the mixed mono signal
             let now = Date()
             guard now > self.fftNextFire else { return }
             self.fftNextFire = now.addingTimeInterval(1.0 / 30.0)
-            // Build a short mono mix array for FFT (avoids mutating ch0 in place)
-            if ch1 != nil {
+            if let ch1 {
                 var mixed = [Float](repeating: 0, count: n)
                 mixed.withUnsafeMutableBufferPointer { buf in
-                    for i in 0..<n { buf[i] = (ch0[i] + ch1![i]) * 0.5 }
+                    for i in 0..<n { buf[i] = (ch0[i] + ch1[i]) * 0.5 }
                 }
                 mixed.withUnsafeBufferPointer { self.computeFFT(samples: $0.baseAddress!, count: n) }
             } else {
@@ -215,6 +223,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             }
         }
         inputTapInstalled = true
+        log.info("installInputTap: tap installed ✓")
     }
 
     // MARK: - FFT
@@ -574,6 +583,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         recordingPhase  = loopPosition
         isRecording     = true
         updatePlaybackVolume()
+        log.info("startRecording: tapInstalled=\(self.inputTapInstalled) captureStart=\(self.captureStartPos) ringWrite=\(self.ringWritePos)")
     }
 
     func stopRecording() {
@@ -586,8 +596,10 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         if isFirst { hasAnyLoop = true }
         let capturedPhase = isFirst ? 0.0 : recordingPhase
         let start         = captureStartPos
+        log.info("stopRecording: frames=\(endPos - start) tapInstalled=\(self.inputTapInstalled) captureFmt sr=\(self.captureFormat?.sampleRate ?? 0)")
 
         guard let buf = drainRingBuffer(from: start, to: endPos) else {
+            log.error("stopRecording: drainRingBuffer returned nil (frames=\(endPos - start), captureFormat=\(String(describing: self.captureFormat)))")
             if isFirst { hasAnyLoop = false }
             return
         }
