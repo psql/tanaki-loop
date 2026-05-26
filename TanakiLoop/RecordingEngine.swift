@@ -126,11 +126,15 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private func handleRouteChange(_ notification: Notification) {
         setupAudioSession()
         updatePlaybackVolume()
-        // Reset the tap — the new device likely has a different format/channel count.
         if inputTapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             inputTapInstalled = false
-            if audioEngine.isRunning { installInputTap() }
+        }
+        // Delay reinstall: USB hardware needs ~100 ms to negotiate a valid format
+        // after the route-change notification fires.
+        guard audioEngine.isRunning else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.installInputTap()
         }
     }
 
@@ -164,9 +168,23 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         guard !inputTapInstalled else { return }
         let inputNode = audioEngine.inputNode
         let hwFmt     = inputNode.outputFormat(forBus: 0)
+
+        // During USB hot-plug the port type string may be "Other" (unrecognised by
+        // iOS 26) and the format comes back with sampleRate=0/channelCount=0.
+        // Installing a tap on a zero format crashes with IsFormatSampleRateAndChannelCountValid.
+        // Back off and retry once the hardware has fully negotiated.
+        guard hwFmt.sampleRate > 0, hwFmt.channelCount > 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.installInputTap()
+            }
+            return
+        }
+
         captureFormat = AVAudioFormat(standardFormatWithSampleRate: hwFmt.sampleRate, channels: 1)
 
-        inputNode.installTap(onBus: 0, bufferSize: 512, format: hwFmt) { [weak self] buffer, _ in
+        // Pass nil so AVAudioEngine owns the format decision; avoids a mismatch if the
+        // hardware reports a slightly different format than what we just read.
+        inputNode.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
             guard let self, let chData = buffer.floatChannelData else { return }
             let n          = Int(buffer.frameLength)
             let cap        = self.ringCapacity
