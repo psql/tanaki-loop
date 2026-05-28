@@ -576,6 +576,49 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Loop length scaling
 
+    // Fine-tune loop duration by a small delta (positive = longer, negative = shorter).
+    // Trims or pads each sample buffer without changing phase offsets.
+    func trimLoop(delta: TimeInterval) {
+        guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
+        let newDur = max(0.10, dur + delta)
+        guard abs(newDur - dur) > 0.0005 else { return }
+
+        let rawElapsed = currentRawElapsed(within: newDur)
+        let wasPlaying = isPlaying
+        playerNodes.values.forEach { $0.stop() }
+        isPlaying = false
+        positionTimer?.invalidate(); positionTimer = nil
+
+        for i in 0..<samples.count {
+            let id = samples[i].id
+            guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
+            let targetFrames = AVAudioFrameCount(newDur * buf.format.sampleRate)
+            let finalBuf: AVAudioPCMBuffer
+            if targetFrames <= buf.frameLength {
+                buf.frameLength = max(targetFrames, 1)
+                finalBuf = buf
+            } else {
+                finalBuf = padBuffer(buf, toDuration: newDur) ?? buf
+                sampleBufs[id] = finalBuf
+            }
+            samples[i].duration = newDur
+            let phase      = samples[i].phaseOffset
+            let distance   = (rawElapsed / newDur - phase + 1.0).truncatingRemainder(dividingBy: 1.0)
+            let frameOff   = AVAudioFrameCount(distance * Double(finalBuf.frameLength))
+            let tailFrames = finalBuf.frameLength > frameOff ? finalBuf.frameLength - frameOff : 0
+            scheduleFromOffset(node: node, buf: finalBuf, frameOffset: frameOff, tailFrames: tailFrames)
+        }
+
+        loopDuration   = newDur
+        loopStartDate  = Date().addingTimeInterval(-rawElapsed)
+        pausedPosition = rawElapsed / newDur
+        if wasPlaying {
+            playerNodes.values.forEach { $0.play() }
+            isPlaying = true
+            startPositionTimer()
+        }
+    }
+
     func doubleLoopLength() {
         guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
         let newDur     = dur * 2

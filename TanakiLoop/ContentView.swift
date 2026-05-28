@@ -295,6 +295,19 @@ struct ContentView: View {
         )
     }
 
+    // MARK: - Loop trim button
+
+    private func trimButton(delta: TimeInterval, label: String) -> some View {
+        Button { engine.trimLoop(delta: delta) } label: {
+            Image(systemName: label)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.white.opacity(0.70))
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(Color.white.opacity(0.10)))
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Bottom bar
 
     private var bottomBar: some View {
@@ -322,13 +335,19 @@ struct ContentView: View {
             .disabled(engine.samples.isEmpty)
 
             ZStack {
-                if let dur = engine.loopDuration {
-                    Text(String(format: "%.1fs", dur))
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.55))
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.10)))
-                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                if engine.loopDuration != nil {
+                    HStack(spacing: 6) {
+                        trimButton(delta: -0.020, label: "minus")
+                        if let dur = engine.loopDuration {
+                            Text(String(format: "%.2fs", dur))
+                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.55))
+                                .frame(minWidth: 46)
+                                .monospacedDigit()
+                        }
+                        trimButton(delta: +0.020, label: "plus")
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
                 } else {
                     Color.clear.frame(width: 44, height: 26)
                 }
