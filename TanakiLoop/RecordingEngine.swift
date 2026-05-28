@@ -67,8 +67,9 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Init
 
-    private var routeObserver:  NSObjectProtocol?
-    private var engineObserver: NSObjectProtocol?
+    private var routeObserver:    NSObjectProtocol?
+    private var engineObserver:   NSObjectProtocol?
+    private var routeChangeWork:  DispatchWorkItem?
 
     init() {
         setupAudioSession()
@@ -102,12 +103,13 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         var opts: AVAudioSession.CategoryOptions = [.mixWithOthers]
         if !externalOutputConnected { opts.insert(.defaultToSpeaker) }
         try? s.setCategory(.playAndRecord, mode: .default, options: opts)
-        // Hint preferred format so inputNode.outputFormat has a valid value even
-        // when iOS can't identify the USB device's port type string ("Other").
         try? s.setPreferredSampleRate(48_000)
-        try? s.setPreferredInputNumberOfChannels(2)
+        // Never request more channels than available — on iOS 26, requesting 2 when only
+        // 1 is present (built-in mic) causes a continuous route re-negotiation storm.
+        let availCh = max(1, s.inputNumberOfChannels)
+        try? s.setPreferredInputNumberOfChannels(min(2, availCh))
         try? s.setActive(true)
-        log.info("setupAudioSession: external=\(self.externalOutputConnected) sr=\(s.sampleRate) inputs=\(s.inputNumberOfChannels)")
+        log.info("setupAudioSession: external=\(self.externalOutputConnected) sr=\(s.sampleRate) inputs=\(availCh)")
         #endif
     }
 
@@ -132,17 +134,21 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     // Re-apply session options and re-install the input tap whenever the hardware
     // route changes (USB interface plugged in or removed).
     private func handleRouteChange(_ notification: Notification) {
+        // Debounce: iOS 26 can fire dozens of route-change notifications in rapid succession
+        // (especially during route negotiation). Cancel any pending work and reschedule so
+        // we only act once, 300 ms after the last notification in the burst.
+        routeChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.applyRouteChange() }
+        routeChangeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
+    }
+
+    private func applyRouteChange() {
         setupAudioSession()
         updatePlaybackVolume()
         teardownInputTap()
-        // Do NOT manually stop the engine here — stopping triggers AVAudioEngineConfigurationChange,
-        // causing a double-restart race with handleEngineConfigChange. Instead, just reinstall
-        // the tap after the USB hardware finishes negotiating its format (~200 ms).
-        // If iOS itself stops the engine (config change), handleEngineConfigChange handles the restart.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self, self.audioEngine.isRunning, !self.inputTapInstalled else { return }
-            self.installInputTap()
-        }
+        guard audioEngine.isRunning, !inputTapInstalled else { return }
+        installInputTap()
     }
 
     // AVAudioEngine posts this when hardware configuration changes and stops the engine.
@@ -204,6 +210,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     private func installInputTap() {
         guard !inputTapInstalled else { return }
+        inputTapInstalled = true   // claim immediately — prevents double-install from concurrent calls
         let inputNode = audioEngine.inputNode
         let hwFmt     = inputNode.outputFormat(forBus: 0)
 
@@ -847,12 +854,14 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
         let sample = Sample(url: url, duration: finalDur, naturalDuration: rawDur, phaseOffset: capturedPhase)
         let node   = AVAudioPlayerNode()
-        audioEngine.attach(node)
-        audioEngine.connect(node, to: audioEngine.mainMixerNode, format: finalBuf.format)
-        startEngineIfNeeded()
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // Attach / connect / start must happen on main — keep engine ops off background threads.
+            self.audioEngine.attach(node)
+            self.audioEngine.connect(node, to: self.audioEngine.mainMixerNode, format: finalBuf.format)
+            self.startEngineIfNeeded()
+
             if isFirst {
                 self.loopDuration   = finalDur
                 self.loopStartDate  = Date()
