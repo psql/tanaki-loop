@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import Accelerate
 import OSLog
 
@@ -37,6 +38,11 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private var captureStartPos: Int = 0
     private var captureFormat:   AVAudioFormat?
 
+    // AudioQueue fallback — used when AVAudioEngine inputNode reports sr=0 (iOS 26 USB "Other" bug)
+    private var inputQueue:          AudioQueueRef? = nil
+    private var aqChannels:          Int            = 1
+    private var usingAudioQueueInput: Bool          = false
+
     // MARK: - FFT
 
     private let fftN         = 1024
@@ -69,7 +75,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         fftSetup = vDSP_create_fftsetup(vDSP_Length(10), FFTRadix(kFFTRadix2))
         vDSP_hann_window(&fftWindow, vDSP_Length(fftN), Int32(vDSP_HANN_DENORM))
         #if os(iOS)
-        AVAudioApplication.requestRecordPermission { _ in }
+        AVAudioSession.sharedInstance().requestRecordPermission { _ in }
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: nil, queue: .main
@@ -82,7 +88,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     }
 
     deinit {
-        if inputTapInstalled { audioEngine.inputNode.removeTap(onBus: 0) }
+        teardownInputTap()
         if let setup = fftSetup { vDSP_destroy_fftsetup(setup) }
         if let obs = routeObserver  { NotificationCenter.default.removeObserver(obs) }
         if let obs = engineObserver { NotificationCenter.default.removeObserver(obs) }
@@ -105,16 +111,13 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         #endif
     }
 
-    // True when any external audio output (wired, BT, or USB interface) is active.
+    // True when any non-built-in output is active (headphones, BT, USB — including
+    // USB interfaces whose port type iOS reports as "Other" instead of .usbAudio).
     private var externalOutputConnected: Bool {
         #if os(iOS)
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
         return outputs.contains {
-            $0.portType == .headphones    ||
-            $0.portType == .bluetoothA2DP ||
-            $0.portType == .bluetoothHFP  ||
-            $0.portType == .bluetoothLE   ||
-            $0.portType == .usbAudio
+            $0.portType != .builtInSpeaker && $0.portType != .builtInReceiver
         }
         #else
         return true
@@ -131,31 +134,61 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private func handleRouteChange(_ notification: Notification) {
         setupAudioSession()
         updatePlaybackVolume()
-        if inputTapInstalled {
-            audioEngine.inputNode.removeTap(onBus: 0)
-            inputTapInstalled = false
-        }
-        // Delay reinstall: USB hardware needs ~100 ms to negotiate a valid format
-        // after the route-change notification fires.
-        guard audioEngine.isRunning else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.installInputTap()
+        teardownInputTap()
+        // Do NOT manually stop the engine here — stopping triggers AVAudioEngineConfigurationChange,
+        // causing a double-restart race with handleEngineConfigChange. Instead, just reinstall
+        // the tap after the USB hardware finishes negotiating its format (~200 ms).
+        // If iOS itself stops the engine (config change), handleEngineConfigChange handles the restart.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.audioEngine.isRunning, !self.inputTapInstalled else { return }
+            self.installInputTap()
         }
     }
 
     // AVAudioEngine posts this when hardware configuration changes and stops the engine.
-    // Reconnect all player nodes (their graph connections are invalidated) and restart.
+    // Reconnect all player nodes (graph connections are invalidated) and restart.
     private func handleEngineConfigChange() {
+        let wasPlaying = isPlaying
+        teardownInputTap()
         for (id, node) in playerNodes {
             guard let buf = sampleBufs[id] else { continue }
             audioEngine.attach(node)
             audioEngine.connect(node, to: audioEngine.mainMixerNode, format: buf.format)
         }
-        if inputTapInstalled {
-            audioEngine.inputNode.removeTap(onBus: 0)
-            inputTapInstalled = false
+        guard wasPlaying || isRecording else { return }
+        setupAudioSession()
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            log.error("handleEngineConfigChange: restart failed: \(error)")
+            return
         }
-        if isPlaying || isRecording { startEngineIfNeeded() }
+        installInputTap()
+        if wasPlaying { rescheduleAndPlay() }
+    }
+
+    // Reschedule all sample buffers from the current loop position and resume playback.
+    private func rescheduleAndPlay() {
+        guard let dur = loopDuration, dur > 0 else { return }
+        let pos: Double
+        if let start = loopStartDate {
+            pos = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
+        } else {
+            pos = pausedPosition
+        }
+        for sample in samples {
+            guard let node = playerNodes[sample.id],
+                  let buf  = sampleBufs[sample.id] else { continue }
+            let distance   = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
+            let frameOff   = AVAudioFrameCount(distance * Double(buf.frameLength))
+            let tailFrames = buf.frameLength > frameOff ? buf.frameLength - frameOff : 0
+            scheduleFromOffset(node: node, buf: buf, frameOffset: frameOff, tailFrames: tailFrames)
+            node.play()
+        }
+        isPlaying     = true
+        loopStartDate = Date().addingTimeInterval(-pos * dur)
+        startPositionTimer()
     }
 
     // MARK: - Engine lifecycle
@@ -174,56 +207,163 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         let inputNode = audioEngine.inputNode
         let hwFmt     = inputNode.outputFormat(forBus: 0)
 
-        // iOS 26 may report sampleRate=0/channelCount=0 for USB devices with an
-        // unrecognised port type string ("Other"). We must NOT pass a zero-SR
-        // format to installTap (crashes). Instead, build a valid format ourselves
-        // and let AVAudioEngine convert. Fallback: 48 kHz mono (RODE default).
-        let sr: Double            = hwFmt.sampleRate   > 0 ? hwFmt.sampleRate   : 48_000
-        let ch: AVAudioChannelCount = hwFmt.channelCount > 0 ? min(hwFmt.channelCount, 2) : 1
-        guard let tapFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: ch) else {
-            log.error("installInputTap: could not construct format sr=\(sr) ch=\(ch)")
+        #if os(iOS)
+        let session   = AVAudioSession.sharedInstance()
+        let sessionSR = session.sampleRate
+        let sessionCh = session.inputNumberOfChannels
+        #else
+        let sessionSR = 44_100.0
+        let sessionCh = 1
+        #endif
+
+        log.info("installInputTap: hwFmt sr=\(hwFmt.sampleRate) ch=\(hwFmt.channelCount) sessionSR=\(sessionSR) sessionCh=\(sessionCh)")
+
+        if hwFmt.sampleRate > 0 {
+            // Standard path: engine knows the hw format, tap with nil (native format).
+            captureFormat = AVAudioFormat(standardFormatWithSampleRate: hwFmt.sampleRate, channels: 1)
+            inputNode.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
+                self?.processEngineTapBuffer(buffer)
+            }
+            inputTapInstalled = true
+            log.info("installInputTap: engine tap installed ✓ sr=\(hwFmt.sampleRate)")
+        } else {
+            // iOS 26 USB "Other" fallback: inputNode can't resolve format (sr=0).
+            // AudioQueue bypasses AVAudioEngine format detection and talks to CoreAudio directly.
+            let sr = sessionSR > 0 ? sessionSR : 48_000.0
+            let ch = max(1, min(2, sessionCh))
+            startAudioQueueInput(sampleRate: sr, channels: ch)
+        }
+    }
+
+    // Shared input buffer processing for AVAudioEngine tap path.
+    private func processEngineTapBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let chData = buffer.floatChannelData else { return }
+        let n       = Int(buffer.frameLength)
+        let chCount = Int(buffer.format.channelCount)
+        let ch0     = chData[0]
+        let ch1: UnsafeMutablePointer<Float>? = chCount > 1 ? chData[1] : nil
+
+        if let cf = captureFormat, cf.sampleRate != buffer.format.sampleRate {
+            captureFormat = AVAudioFormat(standardFormatWithSampleRate: buffer.format.sampleRate, channels: 1)
+            log.info("captureFormat updated to \(buffer.format.sampleRate) Hz")
+        }
+
+        let cap = ringCapacity
+        for i in 0..<n {
+            ringBuffer[ringWritePos % cap] = ch1 != nil ? (ch0[i] + ch1![i]) * 0.5 : ch0[i]
+            ringWritePos += 1
+        }
+
+        let now = Date()
+        guard now > fftNextFire else { return }
+        fftNextFire = now.addingTimeInterval(1.0 / 30.0)
+        if let ch1 {
+            var mixed = [Float](repeating: 0, count: n)
+            mixed.withUnsafeMutableBufferPointer { buf in
+                for i in 0..<n { buf[i] = (ch0[i] + ch1[i]) * 0.5 }
+            }
+            mixed.withUnsafeBufferPointer { computeFFT(samples: $0.baseAddress!, count: n) }
+        } else {
+            computeFFT(samples: ch0, count: n)
+        }
+    }
+
+    // Called from AudioQueue C callback — must be fast, no allocations.
+    func processRawAudioSamples(ptr: UnsafePointer<Float>, frameCount: Int, channelCount: Int) {
+        let cap = ringCapacity
+        for i in 0..<frameCount {
+            let s: Float = channelCount > 1
+                ? (ptr[i * channelCount] + ptr[i * channelCount + 1]) * 0.5
+                : ptr[i]
+            ringBuffer[ringWritePos % cap] = s
+            ringWritePos += 1
+        }
+        let now = Date()
+        guard now > fftNextFire else { return }
+        fftNextFire = now.addingTimeInterval(1.0 / 30.0)
+        if channelCount > 1 {
+            var mixed = [Float](repeating: 0, count: frameCount)
+            mixed.withUnsafeMutableBufferPointer { buf in
+                for i in 0..<frameCount { buf[i] = (ptr[i * channelCount] + ptr[i * channelCount + 1]) * 0.5 }
+            }
+            mixed.withUnsafeBufferPointer { computeFFT(samples: $0.baseAddress!, count: frameCount) }
+        } else {
+            computeFFT(samples: ptr, count: frameCount)
+        }
+    }
+
+    // MARK: - AudioQueue input (iOS 26 USB "Other" fallback)
+
+    private func startAudioQueueInput(sampleRate: Double, channels: Int) {
+        aqChannels = channels
+        captureFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channels) * 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channels) * 4,
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+
+        // C callback: no Swift captures allowed — engine is recovered via userData.
+        let aqCallback: AudioQueueInputCallback = { userData, queue, buffer, _, numPackets, _ in
+            defer { AudioQueueEnqueueBuffer(queue, buffer, 0, nil) }
+            guard let userData, numPackets > 0 else { return }
+            let engine    = Unmanaged<JammyEngine>.fromOpaque(userData).takeUnretainedValue()
+            let ch        = engine.aqChannels
+            let byteCount = Int(buffer.pointee.mAudioDataByteSize)
+            let frames    = byteCount / (ch * 4)
+            guard frames > 0 else { return }
+            let ptr = buffer.pointee.mAudioData.assumingMemoryBound(to: Float.self)
+            engine.processRawAudioSamples(ptr: ptr, frameCount: frames, channelCount: ch)
+        }
+
+        let selfRef = Unmanaged.passUnretained(self).toOpaque()
+        guard AudioQueueNewInput(&asbd, aqCallback, selfRef, nil, nil, 0, &inputQueue) == noErr,
+              let q = inputQueue else {
+            log.error("startAudioQueueInput: AudioQueueNewInput failed sr=\(sampleRate) ch=\(channels)")
             return
         }
-        captureFormat = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1)
 
-        log.info("installInputTap: hwFmt sr=\(hwFmt.sampleRate) ch=\(hwFmt.channelCount) → tapFmt sr=\(sr) ch=\(ch)")
-
-        inputNode.installTap(onBus: 0, bufferSize: 512, format: tapFmt) { [weak self] buffer, _ in
-            guard let self, let chData = buffer.floatChannelData else { return }
-            let n       = Int(buffer.frameLength)
-            let cap     = self.ringCapacity
-            let chCount = Int(buffer.format.channelCount)
-            let ch0     = chData[0]
-            let ch1     = chCount > 1 ? chData[1] : nil
-
-            // Update captureFormat from the first real buffer in case the engine
-            // negotiated a different sample rate than what hwFmt reported.
-            if let cf = self.captureFormat, cf.sampleRate != buffer.format.sampleRate {
-                self.captureFormat = AVAudioFormat(standardFormatWithSampleRate: buffer.format.sampleRate, channels: 1)
-                log.info("captureFormat updated to \(buffer.format.sampleRate) Hz from first buffer")
-            }
-
-            for i in 0..<n {
-                let s = ch1 != nil ? (ch0[i] + ch1![i]) * 0.5 : ch0[i]
-                self.ringBuffer[self.ringWritePos % cap] = s
-                self.ringWritePos += 1
-            }
-
-            let now = Date()
-            guard now > self.fftNextFire else { return }
-            self.fftNextFire = now.addingTimeInterval(1.0 / 30.0)
-            if let ch1 {
-                var mixed = [Float](repeating: 0, count: n)
-                mixed.withUnsafeMutableBufferPointer { buf in
-                    for i in 0..<n { buf[i] = (ch0[i] + ch1[i]) * 0.5 }
-                }
-                mixed.withUnsafeBufferPointer { self.computeFFT(samples: $0.baseAddress!, count: n) }
-            } else {
-                self.computeFFT(samples: ch0, count: n)
+        let bufSize = UInt32(512 * channels * 4)
+        for _ in 0..<3 {
+            var buf: AudioQueueBufferRef?
+            if AudioQueueAllocateBuffer(q, bufSize, &buf) == noErr, let buf {
+                AudioQueueEnqueueBuffer(q, buf, 0, nil)
             }
         }
-        inputTapInstalled = true
-        log.info("installInputTap: tap installed ✓")
+
+        guard AudioQueueStart(q, nil) == noErr else {
+            log.error("startAudioQueueInput: AudioQueueStart failed")
+            AudioQueueDispose(q, true); inputQueue = nil
+            return
+        }
+        usingAudioQueueInput = true
+        inputTapInstalled    = true
+        log.info("startAudioQueueInput: ✓ sr=\(sampleRate) ch=\(channels)")
+    }
+
+    private func stopAudioQueueInput() {
+        guard let q = inputQueue else { return }
+        AudioQueueStop(q, true)
+        AudioQueueDispose(q, true)
+        inputQueue           = nil
+        usingAudioQueueInput = false
+        inputTapInstalled    = false
+    }
+
+    private func teardownInputTap() {
+        if usingAudioQueueInput {
+            stopAudioQueueInput()
+        } else if inputTapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            inputTapInstalled = false
+        }
     }
 
     // MARK: - FFT
@@ -569,7 +709,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         #if os(iOS)
         let perm = AVAudioSession.sharedInstance().recordPermission
         if perm == .undetermined {
-            AVAudioApplication.requestRecordPermission { [weak self] granted in
+            AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
                 if granted { DispatchQueue.main.async { self?.startRecording() } }
             }
             return
@@ -741,3 +881,4 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         return padded
     }
 }
+
