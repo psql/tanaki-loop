@@ -144,7 +144,9 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     }
 
     private func applyRouteChange() {
-        setupAudioSession()
+        // Do NOT call setupAudioSession here — setCategory/setPreferredInputNumberOfChannels
+        // trigger another route change notification, creating an infinite loop.
+        // The session is configured once at init() and iOS handles output routing automatically.
         updatePlaybackVolume()
         teardownInputTap()
         guard audioEngine.isRunning, !inputTapInstalled else { return }
@@ -162,7 +164,6 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             audioEngine.connect(node, to: audioEngine.mainMixerNode, format: buf.format)
         }
         guard wasPlaying || isRecording else { return }
-        setupAudioSession()
         audioEngine.prepare()
         do {
             try audioEngine.start()
