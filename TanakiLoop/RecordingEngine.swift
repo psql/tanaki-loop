@@ -585,45 +585,59 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     // MARK: - Loop length scaling
 
     // Fine-tune loop duration by a small delta (positive = longer, negative = shorter).
-    // Trims or pads each sample buffer without changing phase offsets.
+    // For trim (shorter): shrinks frameLength in-place so the looping player picks up the
+    // new boundary on its next iteration — no stop, no audible gap.
+    // For extend (longer): must stop + reschedule to load the padded buffer.
     func trimLoop(delta: TimeInterval) {
         guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
         let newDur = max(0.10, dur + delta)
         guard abs(newDur - dur) > 0.0005 else { return }
 
-        let rawElapsed = currentRawElapsed(within: newDur)
-        let wasPlaying = isPlaying
-        playerNodes.values.forEach { $0.stop() }
-        isPlaying = false
-        positionTimer?.invalidate(); positionTimer = nil
+        let rawElapsed = currentRawElapsed(within: dur)
+        let clampedElapsed = rawElapsed.truncatingRemainder(dividingBy: newDur)
 
+        // Update timing state (no stop needed for trim path)
+        loopDuration   = newDur
+        loopStartDate  = Date().addingTimeInterval(-clampedElapsed)
+        pausedPosition = clampedElapsed / newDur
+
+        var needsStop = false
         for i in 0..<samples.count {
             let id = samples[i].id
-            guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
+            guard let buf = sampleBufs[id] else { continue }
             let targetFrames = AVAudioFrameCount(newDur * buf.format.sampleRate)
-            let finalBuf: AVAudioPCMBuffer
-            if targetFrames <= buf.frameLength {
-                buf.frameLength = max(targetFrames, 1)
-                finalBuf = buf
-            } else {
-                finalBuf = padBuffer(buf, toDuration: newDur) ?? buf
-                sampleBufs[id] = finalBuf
-            }
             samples[i].duration = newDur
-            let phase      = samples[i].phaseOffset
-            let distance   = (rawElapsed / newDur - phase + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let frameOff   = AVAudioFrameCount(distance * Double(finalBuf.frameLength))
-            let tailFrames = finalBuf.frameLength > frameOff ? finalBuf.frameLength - frameOff : 0
-            scheduleFromOffset(node: node, buf: finalBuf, frameOffset: frameOff, tailFrames: tailFrames)
+            if targetFrames <= buf.frameLength {
+                // Trim: shrink in-place. The playing node detects the new loop boundary
+                // on its next loop iteration — continuous, no click.
+                buf.frameLength = max(targetFrames, 1)
+            } else {
+                // Extend: need a new padded buffer, requires stop + reschedule.
+                let finalBuf = padBuffer(buf, toDuration: newDur) ?? buf
+                sampleBufs[id] = finalBuf
+                needsStop = true
+            }
         }
 
-        loopDuration   = newDur
-        loopStartDate  = Date().addingTimeInterval(-rawElapsed)
-        pausedPosition = rawElapsed / newDur
-        if wasPlaying {
-            playerNodes.values.forEach { $0.play() }
-            isPlaying = true
-            startPositionTimer()
+        if needsStop {
+            let wasPlaying = isPlaying
+            playerNodes.values.forEach { $0.stop() }
+            isPlaying = false
+            positionTimer?.invalidate(); positionTimer = nil
+            for i in 0..<samples.count {
+                let id = samples[i].id
+                guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
+                let phase      = samples[i].phaseOffset
+                let distance   = (clampedElapsed / newDur - phase + 1.0).truncatingRemainder(dividingBy: 1.0)
+                let frameOff   = AVAudioFrameCount(distance * Double(buf.frameLength))
+                let tailFrames = buf.frameLength > frameOff ? buf.frameLength - frameOff : 0
+                scheduleFromOffset(node: node, buf: buf, frameOffset: frameOff, tailFrames: tailFrames)
+            }
+            if wasPlaying {
+                playerNodes.values.forEach { $0.play() }
+                isPlaying = true
+                startPositionTimer()
+            }
         }
     }
 
@@ -771,7 +785,13 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         if !isPlaying && !samples.isEmpty { resumePlayback() }
         startEngineIfNeeded()
         captureStartPos = ringWritePos    // mark start position after engine is up
-        recordingPhase  = loopPosition
+        // Compute phase directly from the clock rather than the 60fps timer value,
+        // which can be up to ~17ms stale — enough to cause audible timing offset on overdubs.
+        if let start = loopStartDate, let dur = loopDuration, dur > 0 {
+            recordingPhase = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
+        } else {
+            recordingPhase = 0.0
+        }
         isRecording     = true
         updatePlaybackVolume()
         log.info("startRecording: tapInstalled=\(self.inputTapInstalled) captureStart=\(self.captureStartPos) ringWrite=\(self.ringWritePos)")

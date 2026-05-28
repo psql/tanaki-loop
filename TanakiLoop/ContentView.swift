@@ -49,28 +49,70 @@ struct ContentView: View {
         ZStack {
             Color(red: 0.09, green: 0.09, blue: 0.12).ignoresSafeArea()
 
-            // Recording color overlay
             if engine.isRecording {
-                recordingColor
-                    .ignoresSafeArea()
-                    .transition(.opacity)
+                recordingColor.ignoresSafeArea().transition(.opacity)
             }
 
-            // Always-on spectrogram (behind rings)
             SpectrogramView(bins: engine.fftMagnitudes, isRecording: engine.isRecording)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-            // Centered record + rings
+            // Trim buttons — left/right screen edges, vertically centered with the ring
+            if engine.loopDuration != nil {
+                HStack {
+                    trimButton(delta: -0.020, label: "minus").padding(.leading, 20)
+                    Spacer()
+                    trimButton(delta: +0.020, label: "plus").padding(.trailing, 20)
+                }
+                .transition(.opacity)
+            }
+
+            // Record ring — centered
             radialCenter
 
-            // Bottom bar
+            // Bottom: undo left, duration center, play/pause right
             VStack {
                 Spacer()
-                bottomBar.padding(.bottom, 52)
+                ZStack {
+                    if let dur = engine.loopDuration {
+                        Text(String(format: "%.2fs", dur))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.45))
+                            .monospacedDigit()
+                    }
+                    HStack {
+                        Button { engine.undo() } label: {
+                            Image(systemName: "arrow.uturn.backward")
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundStyle(.white.opacity(engine.samples.isEmpty ? 0.18 : 0.72))
+                                .frame(width: 56, height: 56)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(engine.samples.isEmpty)
+
+                        Spacer()
+
+                        Button { engine.togglePlayback() } label: {
+                            ZStack {
+                                Circle()
+                                    .fill(Color(red: 0.18, green: 0.18, blue: 0.22))
+                                    .frame(width: 68, height: 68)
+                                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.system(size: 26, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(engine.samples.isEmpty ? 0.18 : 0.84))
+                                    .contentTransition(.symbolEffect(.replace))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(engine.samples.isEmpty)
+                    }
+                    .padding(.horizontal, 32)
+                }
+                .padding(.bottom, 52)
             }
         }
         .animation(.easeInOut(duration: 0.20), value: engine.isRecording)
+        .animation(.easeInOut(duration: 0.15), value: engine.loopDuration != nil)
         .onChange(of: engine.isRecording) { _, recording in
             if !recording { isLatchedRec = false }
         }
@@ -295,65 +337,17 @@ struct ContentView: View {
         )
     }
 
-    // MARK: - Loop trim button
+    // MARK: - Trim button
 
     private func trimButton(delta: TimeInterval, label: String) -> some View {
         Button { engine.trimLoop(delta: delta) } label: {
             Image(systemName: label)
-                .font(.system(size: 12, weight: .bold))
-                .foregroundStyle(.white.opacity(0.70))
-                .frame(width: 30, height: 30)
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(.white.opacity(0.72))
+                .frame(width: 56, height: 56)
                 .background(Circle().fill(Color.white.opacity(0.10)))
         }
         .buttonStyle(.plain)
-    }
-
-    // MARK: - Bottom bar
-
-    private var bottomBar: some View {
-        HStack(spacing: 24) {
-            Button { engine.undo() } label: {
-                Image(systemName: "arrow.uturn.backward")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white.opacity(engine.samples.isEmpty ? 0.18 : 0.70))
-            }
-            .buttonStyle(.plain)
-            .disabled(engine.samples.isEmpty)
-
-            Button { engine.togglePlayback() } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color(red: 0.18, green: 0.18, blue: 0.22))
-                        .frame(width: 64, height: 64)
-                    Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(.white.opacity(engine.samples.isEmpty ? 0.18 : 0.82))
-                        .contentTransition(.symbolEffect(.replace))
-                }
-            }
-            .buttonStyle(.plain)
-            .disabled(engine.samples.isEmpty)
-
-            ZStack {
-                if engine.loopDuration != nil {
-                    HStack(spacing: 6) {
-                        trimButton(delta: -0.020, label: "minus")
-                        if let dur = engine.loopDuration {
-                            Text(String(format: "%.2fs", dur))
-                                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.55))
-                                .frame(minWidth: 46)
-                                .monospacedDigit()
-                        }
-                        trimButton(delta: +0.020, label: "plus")
-                    }
-                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
-                } else {
-                    Color.clear.frame(width: 44, height: 26)
-                }
-            }
-            .animation(.easeInOut(duration: 0.15), value: engine.loopDuration != nil)
-        }
     }
 }
 
