@@ -38,6 +38,7 @@ struct ContentView: View {
     @State private var btnPressed   = false
     @State private var pressStart   = Date()
     @State private var isLatchedRec = false
+    @State private var micPressStartedRec = false   // this mic-tile press initiated recording
 
     // BPM drag state
     @State private var bpmDragBase: Double? = nil
@@ -598,24 +599,51 @@ struct ContentView: View {
                         guard !btnPressed else { return }
                         btnPressed = true
                         pressStart = Date()
-                        if engine.isRecording && isLatchedRec && isRecTarget {
-                            engine.stopRecording()
-                            isLatchedRec = false
-                        } else if !engine.isRecording {
-                            engine.armTrack(i)
-                            engine.startRecording()
-                        }
+                        micTouchDown(slot: i)
                     }
                     .onEnded { _ in
-                        defer { btnPressed = false }
-                        guard engine.isRecording, !isLatchedRec, isRecTarget else { return }
-                        if Date().timeIntervalSince(pressStart) >= 0.35 {
-                            engine.stopRecording()
-                        } else {
-                            isLatchedRec = true
+                        // A tap quick enough can deliver onEnded with no prior onChanged —
+                        // run the touch-down here so a fast tap still starts recording.
+                        if !btnPressed {
+                            pressStart = Date()
+                            micTouchDown(slot: i)
                         }
+                        btnPressed = false
+                        micTouchUp(slot: i)
                     }
             )
+    }
+
+    // Keezy mic-tile press handling. Uses fresh engine state (not values captured at
+    // view-build time) so a tap on an un-armed slot latches correctly.
+    private func micTouchDown(slot i: Int) {
+        if engine.isRecording {
+            // Pressing the tile that's recording stops it; other tiles do nothing.
+            if engine.armedTrack == i && isLatchedRec {
+                engine.stopRecording()
+                isLatchedRec = false
+            }
+            micPressStartedRec = false
+        } else if engine.isCountingIn {
+            engine.cancelCountIn()
+            micPressStartedRec = false
+        } else {
+            engine.armTrack(i)
+            engine.startRecording()   // begins recording, or a count-in
+            micPressStartedRec = true
+        }
+    }
+
+    private func micTouchUp(slot i: Int) {
+        guard micPressStartedRec else { return }
+        micPressStartedRec = false
+        if engine.isCountingIn { return }   // count-in latches via onChange(isRecording)
+        guard engine.isRecording, engine.armedTrack == i else { return }
+        if Date().timeIntervalSince(pressStart) >= 0.35 {
+            engine.stopRecording()   // held → stop on release
+        } else {
+            isLatchedRec = true       // quick tap → latch on
+        }
     }
 
     // Classic tap tempo: average the recent tap intervals; a long pause starts over.
@@ -1069,6 +1097,12 @@ struct ContentView: View {
                     // If recording but not latched: wait for touch-up to decide hold vs tap
                 }
                 .onEnded { _ in
+                    // A tap quick enough can deliver onEnded with no prior onChanged —
+                    // start recording here so a fast tap still works.
+                    if !btnPressed && !engine.isRecording && !engine.isCountingIn {
+                        engine.startRecording()
+                        isLatchedRec = true
+                    }
                     defer { btnPressed = false }
                     guard engine.isRecording, !isLatchedRec else { return }
                     if Date().timeIntervalSince(pressStart) >= 0.35 {
