@@ -921,7 +921,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 triggerHaptic(.light)
-                engine.selectTrack(ti)
+                engine.armTrack(ti)   // select the row without auditioning the sample
             }
     }
 
