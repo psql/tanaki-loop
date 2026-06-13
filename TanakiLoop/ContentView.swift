@@ -54,6 +54,10 @@ struct ContentView: View {
     // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
     @State private var displayRes = 1
 
+    // Performance mode (ZUI): fullscreen pads while the sequencer keeps running
+    @State private var showPerformance = false
+    @State private var pressedPads: Set<UUID> = []
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -80,6 +84,10 @@ struct ContentView: View {
 
             if showTapTempo {
                 tapTempoOverlay
+            }
+
+            if showPerformance {
+                performanceOverlay
             }
         }
         .animation(.easeInOut(duration: 0.20), value: engine.isRecording)
@@ -127,6 +135,26 @@ struct ContentView: View {
                 }
             }
             .buttonStyle(.plain)
+
+            // Performance mode: zooms into fullscreen pads
+            if showPerformance {
+                Color.clear.frame(width: 40, height: 56)
+            } else {
+                Button {
+                    triggerHaptic(.light)
+                    withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
+                        showPerformance = true
+                    }
+                } label: {
+                    Image(systemName: "play.square.fill")
+                        .font(.system(size: 23, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .frame(width: 40, height: 56)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .matchedGeometryEffect(id: "perfZui", in: zuiNS)
+            }
 
             // Live input meter, toolbar-sized
             SpectrogramView(bins: engine.fftMagnitudes, isRecording: engine.isRecording)
@@ -265,6 +293,108 @@ struct ContentView: View {
         .onTapGesture { registerTempoTap() }
     }
 
+    // MARK: - Performance mode (ZUI)
+
+    // Fullscreen pads — one huge square per sample — for playing live over the
+    // running loop. Triggers fire on touch-down (Keezy feel), monophonic per track.
+    private var performanceOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.97)
+                .ignoresSafeArea()
+                .transition(.opacity)
+
+            Group {
+                if engine.tracks.contains(where: { $0.hasSample }) {
+                    performancePadGrid
+                } else {
+                    Text("RECORD A SAMPLE FIRST")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+            }
+            .padding(16)
+            .padding(.top, 44)
+            .matchedGeometryEffect(id: "perfZui", in: zuiNS)
+
+            VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
+                            showPerformance = false
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .frame(width: 64, height: 64)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 8)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var performancePadGrid: some View {
+        let playable = Array(engine.tracks.enumerated()).filter { $0.element.hasSample }
+        let cols     = playable.count <= 3 ? 1 : 2
+        let rows     = (playable.count + cols - 1) / cols
+        let gap: CGFloat = 14
+
+        return GeometryReader { geo in
+            let padW = (geo.size.width - gap * CGFloat(cols - 1)) / CGFloat(cols)
+            let padH = (geo.size.height - gap * CGFloat(rows - 1)) / CGFloat(rows)
+
+            VStack(spacing: gap) {
+                ForEach(0..<rows, id: \.self) { r in
+                    HStack(spacing: gap) {
+                        ForEach(0..<cols, id: \.self) { c in
+                            let i = r * cols + c
+                            if i < playable.count {
+                                performancePad(ti: playable[i].offset,
+                                               track: playable[i].element,
+                                               w: padW, h: padH)
+                            } else {
+                                Color.clear.frame(width: padW, height: padH)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func performancePad(ti: Int, track: Track, w: CGFloat, h: CGFloat) -> some View {
+        let color      = trackColor(track.colorIndex)
+        let pressed    = pressedPads.contains(track.id)
+        let triggering = isTriggering(track)
+
+        return RoundedRectangle(cornerRadius: 26)
+            .fill(color.opacity(pressed ? 1.0 : (triggering ? 0.95 : 0.78)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 26)
+                    .stroke(.white.opacity(pressed ? 0.7 : 0), lineWidth: 3)
+            )
+            .frame(width: w, height: h)
+            .scaleEffect(pressed ? 0.95 : (triggering ? 1.03 : 1.0))
+            .animation(.spring(response: 0.16, dampingFraction: 0.5), value: pressed)
+            .animation(.spring(response: 0.16, dampingFraction: 0.5), value: triggering)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard !pressedPads.contains(track.id) else { return }
+                        pressedPads.insert(track.id)
+                        triggerHaptic(.light)
+                        engine.selectTrack(ti)   // triggers the sample, touch-down latency
+                    }
+                    .onEnded { _ in pressedPads.remove(track.id) }
+            )
+    }
+
     // Classic tap tempo: average the recent tap intervals; a long pause starts over.
     private func registerTempoTap() {
         let now = Date()
@@ -307,17 +437,16 @@ struct ContentView: View {
         GeometryReader { geo in
             let W = geo.size.width
 
+            // No ScrollView here on purpose: its pan recognizer steals the horizontal
+            // pager drag. All 8 rows + controls fit on screen without scrolling.
             VStack(spacing: 14) {
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(spacing: rowGap) {
-                        barPager(W: W)
-                        if engine.tracks.count < LoopEngine.maxTracks {
-                            addTrackButton(rowH: trackRowH)
-                        }
+                VStack(spacing: rowGap) {
+                    barPager(W: W)
+                    if engine.tracks.count < LoopEngine.maxTracks {
+                        addTrackButton(rowH: trackRowH)
                     }
-                    .padding(.vertical, 6)
                 }
-                .scrollClipDisabled()   // let trigger pops escape the scroll bounds
+                .padding(.vertical, 6)
 
                 pageIndicator
             }
