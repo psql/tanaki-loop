@@ -178,6 +178,8 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         if !externalOutputConnected { opts.insert(.defaultToSpeaker) }
         try? s.setCategory(.playAndRecord, mode: .default, options: opts)
         try? s.setPreferredSampleRate(48_000)
+        // Small IO buffer for snappy pad-trigger latency (default is ~23 ms)
+        try? s.setPreferredIOBufferDuration(0.005)
         // Never request more channels than available — on iOS 26, requesting 2 when only
         // 1 is present (built-in mic) causes a continuous route re-negotiation storm.
         let availCh = max(1, s.inputNumberOfChannels)

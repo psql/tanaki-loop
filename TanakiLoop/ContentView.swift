@@ -336,6 +336,9 @@ struct ContentView: View {
                 Spacer()
             }
         }
+        #if os(iOS)
+        .onAppear { padHitHaptic.prepare() }   // first hit fires without warm-up lag
+        #endif
     }
 
     private var performancePadGrid: some View {
@@ -380,7 +383,9 @@ struct ContentView: View {
             )
             .frame(width: w, height: h)
             .scaleEffect(pressed ? 0.95 : (triggering ? 1.03 : 1.0))
-            .animation(.spring(response: 0.16, dampingFraction: 0.5), value: pressed)
+            // Press-down is near-instant; release keeps the springy bounce-back
+            .animation(pressed ? .easeOut(duration: 0.04)
+                               : .spring(response: 0.30, dampingFraction: 0.5), value: pressed)
             .animation(.spring(response: 0.16, dampingFraction: 0.5), value: triggering)
             .contentShape(Rectangle())
             .gesture(
@@ -388,8 +393,9 @@ struct ContentView: View {
                     .onChanged { _ in
                         guard !pressedPads.contains(track.id) else { return }
                         pressedPads.insert(track.id)
-                        triggerHaptic(.light)
-                        engine.selectTrack(ti)   // triggers the sample, touch-down latency
+                        engine.selectTrack(ti)   // audio first — trigger on touch-down
+                        padHitHaptic.impactOccurred(intensity: 0.9)
+                        padHitHaptic.prepare()
                     }
                     .onEnded { _ in pressedPads.remove(track.id) }
             )
@@ -937,6 +943,7 @@ struct ContentView: View {
 private let metronomeDownbeatHaptic = UIImpactFeedbackGenerator(style: .heavy)
 private let metronomeBeatHaptic     = UIImpactFeedbackGenerator(style: .rigid)
 private let bpmTickHaptic           = UISelectionFeedbackGenerator()
+private let padHitHaptic            = UIImpactFeedbackGenerator(style: .rigid)
 #endif
 
 // MARK: - HoldRepeatButton
