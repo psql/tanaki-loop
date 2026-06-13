@@ -970,6 +970,7 @@ struct ContentView: View {
 
             HStack(spacing: 0) {
                 deleteTrackButton
+                shuffleButton
                 undoRedoButton(systemName: "arrow.uturn.backward", enabled: engine.canUndo) {
                     engine.undo()
                 }
@@ -979,8 +980,22 @@ struct ContentView: View {
                 }
                 countInToggle
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
         }
+    }
+
+    // Shuffles the armed track's pattern on the bar you're viewing.
+    private var shuffleButton: some View {
+        Button {
+            triggerHaptic(.heavy)
+            engine.shufflePattern(track: engine.armedTrack, bar: viewedBar)
+        } label: {
+            Image(systemName: "shuffle")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(armedColor.opacity(0.9))
+                .frame(width: 44, height: 56)
+        }
+        .buttonStyle(.plain)
     }
 
     // Clears the armed track (sample + steps). Rows are permanent — always 8.
@@ -996,7 +1011,7 @@ struct ContentView: View {
             Image(systemName: "trash")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(canDelete ? armedColor.opacity(0.9) : .white.opacity(0.18))
-                .frame(width: 50, height: 56)
+                .frame(width: 44, height: 56)
         }
         .buttonStyle(.plain)
         .disabled(!canDelete)
