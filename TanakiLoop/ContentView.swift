@@ -1,6 +1,7 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+import CoreHaptics
 #endif
 
 // MARK: - Palette
@@ -61,6 +62,7 @@ struct ContentView: View {
     @State private var showPerformance = false
     @State private var pressedPads: Set<UUID> = []
     @State private var padSwipeX: [UUID: CGFloat] = [:]   // interactive swipe-to-delete
+    @State private var scaleInSlots: Set<Int> = []        // slots whose mic tile is appearing
 
     var body: some View {
         ZStack {
@@ -389,7 +391,13 @@ struct ContentView: View {
                 .matchedGeometryEffect(id: "perfZui", in: zuiNS)
 
             VStack {
-                HStack {
+                HStack(spacing: 4) {
+                    undoRedoButton(systemName: "arrow.uturn.backward", enabled: engine.canUndo) {
+                        engine.undo()
+                    }
+                    undoRedoButton(systemName: "arrow.uturn.forward", enabled: engine.canRedo) {
+                        engine.redo()
+                    }
                     Spacer()
                     Button {
                         withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
@@ -403,8 +411,8 @@ struct ContentView: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .padding(.trailing, 8)
                 }
+                .padding(.horizontal, 8)
                 Spacer()
             }
         }
@@ -487,7 +495,11 @@ struct ContentView: View {
                             withAnimation(.easeIn(duration: 0.18)) {
                                 padSwipeX[track.id] = dx > 0 ? w * 2.4 : -w * 2.4
                             }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                            // Once the old tile has fully left, swap to the mic tile and
+                            // let it scale in (handled in performanceMicTile.onAppear) so
+                            // the replacement doesn't pop in harshly.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                                scaleInSlots.insert(ti)
                                 engine.clearTrack(ti)
                                 padSwipeX[track.id] = nil
                             }
@@ -506,29 +518,42 @@ struct ContentView: View {
         let isRecTarget = engine.armedTrack == i && engine.tracks.indices.contains(i)
         let recording   = engine.isRecording && isRecTarget
         let countingIn  = engine.isCountingIn && isRecTarget
+        let slotColor   = engine.tracks.indices.contains(i)
+            ? trackColor(engine.tracks[i].colorIndex) : trackColor(i)
+        let scaleIn     = scaleInSlots.contains(i)
 
         return RoundedRectangle(cornerRadius: 26)
-            .fill(recording ? armedColor.opacity(0.85) : Color(red: 0.12, green: 0.12, blue: 0.14))
+            .fill(recording ? slotColor.opacity(0.85) : Color(red: 0.12, green: 0.12, blue: 0.14))
             .overlay(
                 Group {
                     if recording {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 30, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.9))
+                        // Live mic waveform — shows the tile is listening
+                        MicTileWaveform(bins: engine.fftMagnitudes)
+                            .padding(.horizontal, 18)
+                            .transition(.opacity)
                     } else if countingIn {
                         Text("\(engine.countInBeat)")
                             .font(.system(size: 44, weight: .bold, design: .rounded))
                             .foregroundStyle(.white.opacity(0.9))
                             .contentTransition(.numericText(countsDown: true))
                     } else {
+                        // Mic icon tinted to the slot's track color — visual link to the pad it becomes
                         Image(systemName: "mic")
                             .font(.system(size: 28, weight: .light))
-                            .foregroundStyle(.white.opacity(0.45))
+                            .foregroundStyle(slotColor.opacity(0.85))
                     }
                 }
             )
             .frame(width: w, height: h)
+            .scaleEffect(scaleIn ? 0.45 : 1.0)
+            .opacity(scaleIn ? 0 : 1)
             .animation(.easeInOut(duration: 0.15), value: recording)
+            .onAppear {
+                guard scaleInSlots.contains(i) else { return }
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.66)) {
+                    _ = scaleInSlots.remove(i)
+                }
+            }
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
@@ -1030,24 +1055,52 @@ struct ContentView: View {
 
     private func metronomeBuzz(downbeat: Bool) {
         #if os(iOS)
+        // Core Haptics rather than UIFeedbackGenerator: the latter is suppressed by the
+        // system while the mic is recording (exactly when you want the click), and is
+        // softer. A sharp transient at full intensity reads as a firm metronome tick.
         if downbeat {
-            metronomeDownbeatHaptic.impactOccurred(intensity: 1.0)
+            metronomeHaptics.pulse(intensity: 1.0, sharpness: 0.9)
         } else {
-            metronomeBeatHaptic.impactOccurred(intensity: 0.7)
+            metronomeHaptics.pulse(intensity: 0.65, sharpness: 0.55)
         }
-        // Keep the Taptic Engine warm so the next beat fires with minimal latency
-        metronomeDownbeatHaptic.prepare()
-        metronomeBeatHaptic.prepare()
         #endif
     }
 }
 
 #if os(iOS)
 // Long-lived, prepared generators — beat timing is too tight to recreate them per buzz.
-private let metronomeDownbeatHaptic = UIImpactFeedbackGenerator(style: .heavy)
-private let metronomeBeatHaptic     = UIImpactFeedbackGenerator(style: .rigid)
-private let bpmTickHaptic           = UISelectionFeedbackGenerator()
-private let padHitHaptic            = UIImpactFeedbackGenerator(style: .rigid)
+private let bpmTickHaptic = UISelectionFeedbackGenerator()
+private let padHitHaptic  = UIImpactFeedbackGenerator(style: .rigid)
+private let metronomeHaptics = HapticPulse()
+
+// Core Haptics transient player — strong, precisely-timed pulses that keep firing even
+// while an AVAudioSession recording is active (UIFeedbackGenerator does not).
+final class HapticPulse {
+    private var engine: CHHapticEngine?
+    private let supported = CHHapticEngine.capabilitiesForHardware().supportsHaptics
+
+    init() {
+        guard supported else { return }
+        engine = try? CHHapticEngine()
+        engine?.isAutoShutdownEnabled = true
+        engine?.resetHandler   = { [weak self] in try? self?.engine?.start() }
+        engine?.stoppedHandler = { _ in }
+        try? engine?.start()
+    }
+
+    func pulse(intensity: Float, sharpness: Float) {
+        guard supported, let engine else { return }
+        let params = [
+            CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+            CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
+        ]
+        let event = CHHapticEvent(eventType: .hapticTransient, parameters: params, relativeTime: 0)
+        guard let pattern = try? CHHapticPattern(events: [event], parameters: []),
+              let player  = try? engine.makePlayer(with: pattern) else { return }
+        try? engine.start()          // no-op if already running; wakes it after autoshutdown
+        try? player.start(atTime: CHHapticTimeImmediate)
+    }
+}
 #endif
 
 // MARK: - KeezyGridIcon
@@ -1113,6 +1166,36 @@ private struct HoldRepeatButton: View {
         .onDisappear {
             repeatTimer?.invalidate()
             repeatTimer = nil
+        }
+    }
+}
+
+// MARK: - MicTileWaveform
+
+// Compact symmetric level meter drawn inside a recording mic tile.
+struct MicTileWaveform: View {
+    let bins: [Float]
+
+    var body: some View {
+        Canvas { ctx, size in
+            // Downsample the 64 FFT bins to a handful of fat bars for a chunky, legible look
+            let barCount = 13
+            let mid      = size.height / 2
+            let slot     = size.width / CGFloat(barCount)
+            let barW     = slot * 0.55
+            let src      = bins.count
+
+            for i in 0..<barCount {
+                let s0  = i * src / barCount
+                let s1  = max(s0 + 1, (i + 1) * src / barCount)
+                var m: CGFloat = 0
+                for s in s0..<min(s1, src) { m = max(m, CGFloat(bins[s])) }
+                let h = max(barW, pow(m, 0.6) * size.height * 0.9)
+                let x = slot * CGFloat(i) + (slot - barW) / 2
+                let rect = CGRect(x: x, y: mid - h / 2, width: barW, height: h)
+                ctx.fill(Path(roundedRect: rect, cornerRadius: barW / 2),
+                         with: .color(.white.opacity(0.85)))
+            }
         }
     }
 }
