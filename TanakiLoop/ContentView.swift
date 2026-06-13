@@ -54,9 +54,13 @@ struct ContentView: View {
     // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
     @State private var displayRes = 1
 
+    // Metronome options (ZUI)
+    @State private var showMetronomeOptions = false
+
     // Performance mode (ZUI): fullscreen pads while the sequencer keeps running
     @State private var showPerformance = false
     @State private var pressedPads: Set<UUID> = []
+    @State private var padSwipeX: [UUID: CGFloat] = [:]   // interactive swipe-to-delete
 
     var body: some View {
         ZStack {
@@ -88,6 +92,10 @@ struct ContentView: View {
 
             if showPerformance {
                 performanceOverlay
+            }
+
+            if showMetronomeOptions {
+                metronomeOptionsOverlay
             }
         }
         .animation(.easeInOut(duration: 0.20), value: engine.isRecording)
@@ -155,12 +163,7 @@ struct ContentView: View {
                 .matchedGeometryEffect(id: "perfZui", in: zuiNS)
             }
 
-            // Live input meter, toolbar-sized
-            SpectrogramView(bins: engine.fftMagnitudes, isRecording: engine.isRecording)
-                .frame(height: 44)
-                .frame(maxWidth: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .allowsHitTesting(false)
+            Spacer()
 
             bpmControl
         }
@@ -168,18 +171,27 @@ struct ContentView: View {
 
     private var bpmControl: some View {
         HStack(spacing: 4) {
-            // Metronome lives with the tempo controls
-            Button {
-                engine.toggleMetronome()
-                triggerHaptic(.light)
-            } label: {
+            // Metronome lives with the tempo controls; long-hold opens its options
+            if showMetronomeOptions {
+                Color.clear.frame(width: 36, height: 56)
+            } else {
                 Image(systemName: "metronome.fill")
                     .font(.system(size: 19, weight: .semibold))
                     .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.35))
                     .frame(width: 36, height: 56)
                     .contentShape(Rectangle())
+                    .matchedGeometryEffect(id: "metroZui", in: zuiNS)
+                    .onTapGesture {
+                        engine.toggleMetronome()
+                        triggerHaptic(.light)
+                    }
+                    .onLongPressGesture(minimumDuration: 0.45) {
+                        triggerHaptic(.heavy)
+                        withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
+                            showMetronomeOptions = true
+                        }
+                    }
             }
-            .buttonStyle(.plain)
 
             HoldRepeatButton(systemName: "minus") { step in nudgeBPM(-step) }
 
@@ -292,6 +304,74 @@ struct ContentView: View {
         .onTapGesture { registerTempoTap() }
     }
 
+    // MARK: - Metronome options (ZUI)
+
+    private var metronomeOptionsOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.92)
+                .ignoresSafeArea()
+                .transition(.opacity)
+                .onTapGesture {
+                    withAnimation(.spring(response: 0.40, dampingFraction: 0.82)) {
+                        showMetronomeOptions = false
+                    }
+                }
+
+            VStack(spacing: 24) {
+                VStack(spacing: 8) {
+                    Image(systemName: "metronome.fill")
+                        .font(.system(size: 34, weight: .semibold))
+                        .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.5))
+                    Text("METRONOME")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+
+                metronomeOptionRow(
+                    title: "SILENT MODE",
+                    caption: "haptic buzz only — no click",
+                    isOn: engine.metronomeSilent
+                ) {
+                    engine.toggleMetronomeSilent()
+                }
+            }
+            .padding(30)
+            .frame(maxWidth: 320)
+            .background(
+                RoundedRectangle(cornerRadius: 28)
+                    .fill(Color(red: 0.13, green: 0.13, blue: 0.16))
+            )
+            .matchedGeometryEffect(id: "metroZui", in: zuiNS)
+            .padding(.horizontal, 36)
+        }
+    }
+
+    private func metronomeOptionRow(title: String, caption: String,
+                                    isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            triggerHaptic(.light)
+            action()
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(isOn ? armedColor : .white.opacity(0.4))
+                    .contentTransition(.symbolEffect(.replace))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Text(caption)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Performance mode (ZUI)
 
     // Classic Keezy board: always 8 slots (2×4). Slots with samples are playable
@@ -366,6 +446,7 @@ struct ContentView: View {
         let color      = trackColor(track.colorIndex)
         let pressed    = pressedPads.contains(track.id)
         let triggering = isTriggering(track)
+        let swipeX     = padSwipeX[track.id] ?? 0
 
         return RoundedRectangle(cornerRadius: 26)
             .fill(color.opacity(pressed ? 1.0 : (triggering ? 0.95 : 0.78)))
@@ -379,17 +460,43 @@ struct ContentView: View {
             // Press-down snaps instantly; release keeps the springy bounce-back
             .animation(pressed ? nil : .spring(response: 0.30, dampingFraction: 0.5), value: pressed)
             .animation(.spring(response: 0.16, dampingFraction: 0.5), value: triggering)
+            .offset(x: swipeX)
+            .rotationEffect(.degrees(Double(swipeX) / 30))
+            .opacity(1.0 - Double(min(abs(swipeX) / (w * 1.4), 0.5)))
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        guard !pressedPads.contains(track.id) else { return }
-                        pressedPads.insert(track.id)
-                        engine.selectTrack(ti)   // audio first — trigger on touch-down
-                        padHitHaptic.impactOccurred(intensity: 0.9)
-                        padHitHaptic.prepare()
+                    .onChanged { v in
+                        if !pressedPads.contains(track.id) {
+                            pressedPads.insert(track.id)
+                            engine.selectTrack(ti)   // audio first — trigger on touch-down
+                            padHitHaptic.impactOccurred(intensity: 0.9)
+                            padHitHaptic.prepare()
+                        }
+                        // Drag sideways to throw the tile away — tracks the finger 1:1
+                        if abs(v.translation.width) > 14 {
+                            padSwipeX[track.id] = v.translation.width
+                        }
                     }
-                    .onEnded { _ in pressedPads.remove(track.id) }
+                    .onEnded { _ in
+                        pressedPads.remove(track.id)
+                        let dx = padSwipeX[track.id] ?? 0
+                        if abs(dx) > w * 0.45 {
+                            // Off the edge: fly out, then the slot reverts to a mic tile
+                            triggerHaptic(.heavy)
+                            withAnimation(.easeIn(duration: 0.18)) {
+                                padSwipeX[track.id] = dx > 0 ? w * 2.4 : -w * 2.4
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                                engine.clearTrack(ti)
+                                padSwipeX[track.id] = nil
+                            }
+                        } else if dx != 0 {
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.66)) {
+                                padSwipeX[track.id] = 0
+                            }
+                        }
+                    }
             )
     }
 
@@ -433,10 +540,6 @@ struct ContentView: View {
                             engine.stopRecording()
                             isLatchedRec = false
                         } else if !engine.isRecording {
-                            while engine.tracks.count <= i,
-                                  engine.tracks.count < LoopEngine.maxTracks {
-                                engine.addTrack()
-                            }
                             engine.armTrack(i)
                             engine.startRecording()
                         }
@@ -498,13 +601,8 @@ struct ContentView: View {
             // No ScrollView here on purpose: its pan recognizer steals the horizontal
             // pager drag. All 8 rows + controls fit on screen without scrolling.
             VStack(spacing: 14) {
-                VStack(spacing: rowGap) {
-                    barPager(W: W)
-                    if engine.tracks.count < LoopEngine.maxTracks {
-                        addTrackButton(rowH: trackRowH)
-                    }
-                }
-                .padding(.vertical, 6)
+                barPager(W: W)
+                    .padding(.vertical, 6)
 
                 pageIndicator
             }
@@ -513,7 +611,7 @@ struct ContentView: View {
     }
 
     private var gridMaxHeight: CGFloat {
-        let rows = CGFloat(engine.tracks.count) + (engine.tracks.count < LoopEngine.maxTracks ? 1 : 0)
+        let rows = CGFloat(engine.tracks.count)
         return rows * trackRowH + (rows - 1) * rowGap + 12 + 58
     }
 
@@ -769,27 +867,6 @@ struct ContentView: View {
             }
     }
 
-    private func addTrackButton(rowH: CGFloat) -> some View {
-        HStack(spacing: padGap) {
-            Button {
-                triggerHaptic(.light)
-                engine.addTrack()
-            } label: {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.white.opacity(0.07))
-                    .frame(width: padWidth, height: rowH)
-                    .overlay(
-                        Image(systemName: "plus")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.5))
-                    )
-            }
-            .buttonStyle(.plain)
-            Spacer()
-        }
-        .frame(height: rowH)
-    }
-
     // MARK: - Bottom bar
 
     private var bottomBar: some View {
@@ -811,20 +888,15 @@ struct ContentView: View {
         }
     }
 
-    // Two-stage delete: a track with a sample is cleared first (row stays);
-    // pressing again on the now-empty track removes the whole row.
+    // Clears the armed track (sample + steps). Rows are permanent — always 8.
     private var deleteTrackButton: some View {
-        let armedHasSample = engine.tracks.indices.contains(engine.armedTrack)
-            && engine.tracks[engine.armedTrack].hasSample
-        let canDelete = engine.tracks.count > 1 || armedHasSample
+        let armed = engine.tracks.indices.contains(engine.armedTrack)
+            ? engine.tracks[engine.armedTrack] : nil
+        let canDelete = armed.map { $0.hasSample || $0.hasAnySteps } ?? false
 
         return Button {
             triggerHaptic(.heavy)
-            if armedHasSample {
-                engine.clearTrack(engine.armedTrack)
-            } else {
-                engine.removeTrack(engine.armedTrack)
-            }
+            engine.clearTrack(engine.armedTrack)
         } label: {
             Image(systemName: "trash")
                 .font(.system(size: 22, weight: .semibold))
@@ -873,6 +945,13 @@ struct ContentView: View {
 
     private var recordButton: some View {
         ZStack {
+            // Radial input meter: bars bloom outward around the mic
+            RadialMeterView(bins: engine.fftMagnitudes,
+                            isRecording: engine.isRecording,
+                            tint: armedColor)
+                .frame(width: recordDiam + 64, height: recordDiam + 64)
+                .allowsHitTesting(false)
+
             Circle()
                 .fill(
                     engine.isRecording
@@ -1038,33 +1117,35 @@ private struct HoldRepeatButton: View {
     }
 }
 
-// MARK: - SpectrogramView
+// MARK: - RadialMeterView
 
-struct SpectrogramView: View {
+// Compact input meter: frequency bars radiate outward from the record button's rim.
+struct RadialMeterView: View {
     let bins:        [Float]
     let isRecording: Bool
+    let tint:        Color
 
     var body: some View {
-        GeometryReader { geo in
-            Canvas { ctx, size in
-                let count    = bins.count
-                let barW     = size.width / CGFloat(count)
-                let gap: CGFloat = 1.2
-                let maxH     = size.height * 0.60
-                let baseAlpha = isRecording ? 0.05 : 0.02
-                let scale     = isRecording ? 0.60 : 0.38
+        Canvas { ctx, size in
+            let cx = size.width / 2, cy = size.height / 2
+            let n  = bins.count
+            let r0 = recordDiam / 2 + 5
+            let maxLen = size.width / 2 - r0 - 2
+            let alphaScale = isRecording ? 0.85 : 0.45
 
-                for i in 0..<count {
-                    let mag  = CGFloat(bins[i])
-                    let h    = pow(mag, 0.62) * maxH
-                    guard h > 0.5 else { continue }
-                    let x    = CGFloat(i) * barW + gap * 0.5
-                    let w    = max(1, barW - gap)
-                    let rect = CGRect(x: x, y: size.height - h, width: w, height: h)
-                    let alpha = Double(mag) * scale + baseAlpha
-                    ctx.fill(Path(roundedRect: rect, cornerRadius: 1.5),
-                             with: .color(.white.opacity(alpha)))
-                }
+            for i in 0..<n {
+                let mag = CGFloat(bins[i])
+                let len = pow(mag, 0.62) * maxLen
+                guard len > 0.8 else { continue }
+                let a  = Double(i) / Double(n) * 2 * .pi - .pi / 2
+                let p0 = CGPoint(x: cx + Foundation.cos(a) * r0, y: cy + Foundation.sin(a) * r0)
+                let p1 = CGPoint(x: cx + Foundation.cos(a) * (r0 + len), y: cy + Foundation.sin(a) * (r0 + len))
+                var p  = Path()
+                p.move(to: p0)
+                p.addLine(to: p1)
+                let color = isRecording ? Color.white : tint
+                ctx.stroke(p, with: .color(color.opacity(Double(mag) * alphaScale + 0.04)),
+                           style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
             }
         }
     }

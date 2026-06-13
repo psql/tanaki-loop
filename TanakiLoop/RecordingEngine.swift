@@ -36,7 +36,8 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Published state
 
-    @Published private(set) var tracks:        [Track] = (0..<2).map { Track(colorIndex: $0, bars: 1) }
+    // Always exactly 8 tracks — slots and sequencer rows correspond one-to-one.
+    @Published private(set) var tracks:        [Track] = (0..<8).map { Track(colorIndex: $0, bars: 1) }
     @Published private(set) var isPlaying:     Bool    = false
     @Published private(set) var isRecording:   Bool    = false
     @Published private(set) var currentStep:   Int     = 0    // 0..<16, within the playing bar
@@ -45,7 +46,8 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     @Published private(set) var bpm:           Double  = 120
     @Published private(set) var armedTrack:    Int     = 0
     @Published private(set) var fftMagnitudes: [Float] = [Float](repeating: 0, count: 64)
-    @Published private(set) var metronomeOn:   Bool    = false
+    @Published private(set) var metronomeOn:     Bool  = false
+    @Published private(set) var metronomeSilent: Bool  = false  // haptics only, no click
     @Published private(set) var metronomeBeat: Int     = -1   // 0–3, cycles every beat; 0 = downbeat
     @Published private(set) var countInEnabled: Bool   = false
     @Published private(set) var isCountingIn:   Bool   = false
@@ -96,6 +98,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     private var metroDeadline: DispatchTime = .now()      // seqQueue only
     private var metroBeatCount = 0                        // seqQueue only
     private var metronomeEnabled = false                  // guarded by stateLock
+    private var metronomeSilentValue = false              // guarded by stateLock
 
     // Count-in (seqQueue only)
     private var countTimer: DispatchSourceTimer?
@@ -678,8 +681,19 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         metroTimer = timer
     }
 
+    func toggleMetronomeSilent() {
+        metronomeSilent.toggle()
+        stateLock.lock()
+        metronomeSilentValue = metronomeSilent
+        stateLock.unlock()
+    }
+
     private func playClick(downbeat: Bool) {
-        guard audioEngine.isRunning,
+        stateLock.lock()
+        let silent = metronomeSilentValue
+        stateLock.unlock()
+        guard !silent,                       // silent mode: beats still publish for haptics
+              audioEngine.isRunning,
               let buf = downbeat ? metroAccentBuf : metroTickBuf else { return }
         metroNode.scheduleBuffer(buf, at: nil, completionHandler: nil)
         metroNode.play()
@@ -866,17 +880,6 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Track management
 
-    private var nextColorIndex = 2   // first two are taken by the initial tracks
-
-    func addTrack() {
-        guard tracks.count < Self.maxTracks else { return }
-        pushUndo()
-        tracks.append(Track(colorIndex: nextColorIndex, bars: barCount))
-        nextColorIndex += 1
-        armedTrack = tracks.count - 1
-        syncGrid()
-    }
-
     // Arm the track for recording; if it already holds a sample, audition it (Keezy pad feel).
     func selectTrack(_ index: Int) {
         guard tracks.indices.contains(index) else { return }
@@ -894,32 +897,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         armedTrack = index
     }
 
-    // Removes the whole track (sample, steps, and the row itself).
-    // The last remaining track is kept but emptied — the grid never goes to zero rows.
-    func removeTrack(_ index: Int) {
-        guard tracks.indices.contains(index) else { return }
-        pushUndo()
-        let id = tracks[index].id
-        stateLock.lock()
-        if let node = playerNodes[id] {
-            node.stop()
-            audioEngine.detach(node)
-        }
-        playerNodes.removeValue(forKey: id)
-        sampleBufs.removeValue(forKey: id)
-        stateLock.unlock()
-
-        if tracks.count > 1 {
-            tracks.remove(at: index)
-        } else {
-            tracks[index] = Track(colorIndex: tracks[index].colorIndex, bars: barCount)
-        }
-        armedTrack = min(armedTrack, tracks.count - 1)
-        syncGrid()
-    }
-
-    // Clears a track's sample and steps but keeps the row (first stage of the
-    // two-stage trash: clear sample first, then a second press removes the row).
+    // Clears a track's sample and steps — the row itself is permanent (always 8).
     func clearTrack(_ index: Int) {
         guard tracks.indices.contains(index) else { return }
         pushUndo()
