@@ -382,7 +382,8 @@ struct ContentView: View {
                     .stroke(.white.opacity(pressed ? 0.7 : 0), lineWidth: 3)
             )
             .frame(width: w, height: h)
-            .scaleEffect(pressed ? 0.95 : (triggering ? 1.03 : 1.0))
+            .scaleEffect(pressed ? 0.86 : (triggering ? 1.03 : 1.0))
+            .brightness(pressed ? 0.10 : 0)
             // Press-down is near-instant; release keeps the springy bounce-back
             .animation(pressed ? .easeOut(duration: 0.04)
                                : .spring(response: 0.30, dampingFraction: 0.5), value: pressed)
