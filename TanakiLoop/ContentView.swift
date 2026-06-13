@@ -64,7 +64,7 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 transportBar
-                    .padding(.horizontal, 24)
+                    .padding(.horizontal, 16)
                     .padding(.top, 8)
 
                 Spacer(minLength: 16)
@@ -149,7 +149,7 @@ struct ContentView: View {
                 Image(systemName: "metronome.fill")
                     .font(.system(size: 19, weight: .semibold))
                     .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.35))
-                    .frame(width: 40, height: 56)
+                    .frame(width: 36, height: 56)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -158,7 +158,7 @@ struct ContentView: View {
 
             if showTapTempo {
                 // Placeholder keeps the toolbar layout while the label is zoomed out
-                Color.clear.frame(width: 62, height: 56)
+                Color.clear.frame(width: 58, height: 56)
             } else {
                 bpmLabel
                     .matchedGeometryEffect(id: "bpmZui", in: zuiNS)
@@ -194,7 +194,7 @@ struct ContentView: View {
                 .font(.system(size: 9, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.40))
         }
-        .frame(width: 62, height: 56)
+        .frame(width: 58, height: 56)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color(red: 0.16, green: 0.16, blue: 0.20).opacity(0.01)))
         .contentShape(Rectangle())
     }
@@ -327,7 +327,7 @@ struct ContentView: View {
 
     private var gridMaxHeight: CGFloat {
         let rows = CGFloat(engine.tracks.count) + (engine.tracks.count < LoopEngine.maxTracks ? 1 : 0)
-        return rows * trackRowH + (rows - 1) * rowGap + 12 + 30
+        return rows * trackRowH + (rows - 1) * rowGap + 12 + 58
     }
 
     // MARK: - Bar pager
@@ -443,8 +443,8 @@ struct ContentView: View {
                                 .frame(width: 13, height: 13)
                         }
                     }
-                    .frame(width: 18, height: 18)
-                    .contentShape(Circle().scale(1.8))
+                    .frame(width: 14, height: 14)
+                    .contentShape(Circle().scale(2.4))
                     .onTapGesture {
                         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { viewedBar = bar }
                     }
@@ -466,9 +466,9 @@ struct ContentView: View {
                 displayRes *= 2
             }
             Text("1/\(LoopEngine.stepCount / displayRes)")
-                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .font(.system(size: 11, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.45))
-                .frame(width: 28)
+                .frame(width: 32)
                 .monospacedDigit()
             zoomButton(systemName: "plus.magnifyingglass", enabled: displayRes > 1) {
                 displayRes /= 2
@@ -482,9 +482,9 @@ struct ContentView: View {
             withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { action() }
         } label: {
             Image(systemName: systemName)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.white.opacity(enabled ? 0.6 : 0.18))
-                .frame(width: 34, height: 30)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.white.opacity(enabled ? 0.65 : 0.18))
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -501,9 +501,9 @@ struct ContentView: View {
             }
         } label: {
             Image(systemName: "minus.circle")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 19, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.55))
-                .frame(width: 38, height: 30)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -830,7 +830,7 @@ private struct HoldRepeatButton: View {
                 .font(.system(size: 20, weight: .bold))
                 .foregroundStyle(.white.opacity(pressed ? 0.95 : 0.65))
         }
-        .frame(width: 56, height: 56)
+        .frame(width: 52, height: 52)
         .scaleEffect(pressed ? 0.90 : 1.0)
         .animation(.spring(response: 0.18, dampingFraction: 0.6), value: pressed)
         .contentShape(Circle().scale(1.35))   // hit area generously larger than the visual
