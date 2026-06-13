@@ -146,8 +146,7 @@ struct ContentView: View {
                         showPerformance = true
                     }
                 } label: {
-                    Image(systemName: "play.square.fill")
-                        .font(.system(size: 23, weight: .semibold))
+                    KeezyGridIcon()
                         .foregroundStyle(.white.opacity(0.55))
                         .frame(width: 40, height: 56)
                         .contentShape(Rectangle())
@@ -295,26 +294,19 @@ struct ContentView: View {
 
     // MARK: - Performance mode (ZUI)
 
-    // Fullscreen pads — one huge square per sample — for playing live over the
-    // running loop. Triggers fire on touch-down (Keezy feel), monophonic per track.
+    // Classic Keezy board: always 8 slots (2×4). Slots with samples are playable
+    // pads (trigger on touch-down, monophonic); empty slots are mic tiles you can
+    // record into right here, while the loop keeps running.
     private var performanceOverlay: some View {
         ZStack {
             Color.black.opacity(0.97)
                 .ignoresSafeArea()
                 .transition(.opacity)
 
-            Group {
-                if engine.tracks.contains(where: { $0.hasSample }) {
-                    performancePadGrid
-                } else {
-                    Text("RECORD A SAMPLE FIRST")
-                        .font(.system(size: 13, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.4))
-                }
-            }
-            .padding(16)
-            .padding(.top, 44)
-            .matchedGeometryEffect(id: "perfZui", in: zuiNS)
+            performancePadGrid
+                .padding(16)
+                .padding(.top, 44)
+                .matchedGeometryEffect(id: "perfZui", in: zuiNS)
 
             VStack {
                 HStack {
@@ -324,8 +316,8 @@ struct ContentView: View {
                             showPerformance = false
                         }
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 20, weight: .bold))
+                        Image(systemName: "square.grid.4x3.fill")
+                            .font(.system(size: 19, weight: .semibold))
                             .foregroundStyle(.white.opacity(0.7))
                             .frame(width: 64, height: 64)
                             .contentShape(Rectangle())
@@ -342,10 +334,8 @@ struct ContentView: View {
     }
 
     private var performancePadGrid: some View {
-        let playable = Array(engine.tracks.enumerated()).filter { $0.element.hasSample }
-        let cols     = playable.count <= 3 ? 1 : 2
-        let rows     = (playable.count + cols - 1) / cols
-        let gap: CGFloat = 14
+        let cols = 2, rows = 4
+        let gap: CGFloat = 12
 
         return GeometryReader { geo in
             let padW = (geo.size.width - gap * CGFloat(cols - 1)) / CGFloat(cols)
@@ -355,18 +345,20 @@ struct ContentView: View {
                 ForEach(0..<rows, id: \.self) { r in
                     HStack(spacing: gap) {
                         ForEach(0..<cols, id: \.self) { c in
-                            let i = r * cols + c
-                            if i < playable.count {
-                                performancePad(ti: playable[i].offset,
-                                               track: playable[i].element,
-                                               w: padW, h: padH)
-                            } else {
-                                Color.clear.frame(width: padW, height: padH)
-                            }
+                            performanceSlot(r * cols + c, w: padW, h: padH)
                         }
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func performanceSlot(_ i: Int, w: CGFloat, h: CGFloat) -> some View {
+        if engine.tracks.indices.contains(i), engine.tracks[i].hasSample {
+            performancePad(ti: i, track: engine.tracks[i], w: w, h: h)
+        } else {
+            performanceMicTile(i, w: w, h: h)
         }
     }
 
@@ -384,9 +376,8 @@ struct ContentView: View {
             .frame(width: w, height: h)
             .scaleEffect(pressed ? 0.86 : (triggering ? 1.03 : 1.0))
             .brightness(pressed ? 0.10 : 0)
-            // Press-down is near-instant; release keeps the springy bounce-back
-            .animation(pressed ? .easeOut(duration: 0.04)
-                               : .spring(response: 0.30, dampingFraction: 0.5), value: pressed)
+            // Press-down snaps instantly; release keeps the springy bounce-back
+            .animation(pressed ? nil : .spring(response: 0.30, dampingFraction: 0.5), value: pressed)
             .animation(.spring(response: 0.16, dampingFraction: 0.5), value: triggering)
             .contentShape(Rectangle())
             .gesture(
@@ -399,6 +390,66 @@ struct ContentView: View {
                         padHitHaptic.prepare()
                     }
                     .onEnded { _ in pressedPads.remove(track.id) }
+            )
+    }
+
+    // Empty slot: a mic tile with the full Keezy record gesture — hold to record
+    // while held, quick tap to latch, tap again to stop.
+    private func performanceMicTile(_ i: Int, w: CGFloat, h: CGFloat) -> some View {
+        let isRecTarget = engine.armedTrack == i && engine.tracks.indices.contains(i)
+        let recording   = engine.isRecording && isRecTarget
+        let countingIn  = engine.isCountingIn && isRecTarget
+
+        return RoundedRectangle(cornerRadius: 26)
+            .fill(recording ? armedColor.opacity(0.85) : Color(red: 0.12, green: 0.12, blue: 0.14))
+            .overlay(
+                Group {
+                    if recording {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 30, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.9))
+                    } else if countingIn {
+                        Text("\(engine.countInBeat)")
+                            .font(.system(size: 44, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .contentTransition(.numericText(countsDown: true))
+                    } else {
+                        Image(systemName: "mic")
+                            .font(.system(size: 28, weight: .light))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+            )
+            .frame(width: w, height: h)
+            .animation(.easeInOut(duration: 0.15), value: recording)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard !btnPressed else { return }
+                        btnPressed = true
+                        pressStart = Date()
+                        if engine.isRecording && isLatchedRec && isRecTarget {
+                            engine.stopRecording()
+                            isLatchedRec = false
+                        } else if !engine.isRecording {
+                            while engine.tracks.count <= i,
+                                  engine.tracks.count < LoopEngine.maxTracks {
+                                engine.addTrack()
+                            }
+                            engine.armTrack(i)
+                            engine.startRecording()
+                        }
+                    }
+                    .onEnded { _ in
+                        defer { btnPressed = false }
+                        guard engine.isRecording, !isLatchedRec, isRecTarget else { return }
+                        if Date().timeIntervalSince(pressStart) >= 0.35 {
+                            engine.stopRecording()
+                        } else {
+                            isLatchedRec = true
+                        }
+                    }
             )
     }
 
@@ -919,6 +970,22 @@ private let metronomeBeatHaptic     = UIImpactFeedbackGenerator(style: .rigid)
 private let bpmTickHaptic           = UISelectionFeedbackGenerator()
 private let padHitHaptic            = UIImpactFeedbackGenerator(style: .rigid)
 #endif
+
+// MARK: - KeezyGridIcon
+
+// Literal 2×4 grid of 8 tiles — the performance board in miniature.
+private struct KeezyGridIcon: View {
+    var body: some View {
+        VStack(spacing: 2) {
+            ForEach(0..<4, id: \.self) { _ in
+                HStack(spacing: 2) {
+                    RoundedRectangle(cornerRadius: 1.5).frame(width: 8, height: 5)
+                    RoundedRectangle(cornerRadius: 1.5).frame(width: 8, height: 5)
+                }
+            }
+        }
+    }
+}
 
 // MARK: - HoldRepeatButton
 
