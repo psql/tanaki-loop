@@ -474,10 +474,6 @@ struct ContentView: View {
                 barPage(bar: bar, W: W)
                     .frame(width: W)
             }
-            if engine.barCount < LoopEngine.maxBars {
-                ghostAddPage(W: W)
-                    .frame(width: W)
-            }
         }
         .frame(width: W, alignment: .leading)
         .offset(x: -CGFloat(viewedBar) * W + pageDragX)
@@ -499,64 +495,22 @@ struct ContentView: View {
         }
     }
 
-    // Peeks in from the right past the last bar; release past the threshold to create
-    // a new bar (a copy of the one you dragged from).
-    private func ghostAddPage(W: CGFloat) -> some View {
-        let n      = CGFloat(engine.tracks.count)
-        let height = n * trackRowH + (n - 1) * rowGap
-        let active = viewedBar == engine.barCount - 1 && pageDragX < -addBarThreshold(W: W)
-
-        return RoundedRectangle(cornerRadius: 14)
-            .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [7, 6]))
-            .foregroundStyle(active ? armedColor : .white.opacity(0.25))
-            .frame(height: max(height, trackRowH))
-            .overlay(
-                VStack(spacing: 6) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 26, weight: .bold))
-                    Text("NEW BAR")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                }
-                .foregroundStyle(active ? armedColor : .white.opacity(0.35))
-            )
-            .scaleEffect(active ? 1.0 : 0.94)
-            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: active)
-            .padding(.horizontal, 4)
-    }
-
-    private func addBarThreshold(W: CGFloat) -> CGFloat { W * 0.30 }
-
     private func pageDragGesture(W: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 20)
             .onChanged { v in
-                // Mostly-vertical drags belong to the track ScrollView
+                // Mostly-vertical drags are ignored so sloppy swipes don't page
                 guard abs(v.translation.width) > abs(v.translation.height) || pageDragX != 0 else { return }
                 var dx = v.translation.width
-                let lastIdx = engine.barCount - 1
-                let canAdd  = engine.barCount < LoopEngine.maxBars
-                if viewedBar == 0 && dx > 0 { dx *= 0.35 }                      // rubber band at front
-                if viewedBar == lastIdx && dx < 0 && !canAdd { dx *= 0.35 }     // …and at the cap
+                if viewedBar == 0 && dx > 0 { dx *= 0.35 }                          // rubber band
+                if viewedBar == engine.barCount - 1 && dx < 0 { dx *= 0.35 }
                 pageDragX = dx
             }
             .onEnded { v in
                 let dx        = v.translation.width
                 let threshold = W * 0.22
-                let lastIdx   = engine.barCount - 1
-                let canAdd    = engine.barCount < LoopEngine.maxBars
                 var target    = viewedBar
-
-                if dx < -threshold {
-                    if viewedBar < lastIdx {
-                        target += 1
-                    } else if canAdd && dx < -addBarThreshold(W: W) {
-                        engine.addBar()
-                        triggerHaptic(.heavy)
-                        target += 1
-                    }
-                } else if dx > threshold && viewedBar > 0 {
-                    target -= 1
-                }
-
+                if dx < -threshold && viewedBar < engine.barCount - 1 { target += 1 }
+                if dx >  threshold && viewedBar > 0                   { target -= 1 }
                 withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
                     viewedBar = target
                     pageDragX = 0
@@ -592,8 +546,28 @@ struct ContentView: View {
                 zoomControl
                 Spacer()
                 deleteBarButton
+                addBarButton
             }
         }
+    }
+
+    private var addBarButton: some View {
+        let canAdd = engine.barCount < LoopEngine.maxBars
+        return Button {
+            triggerHaptic(.heavy)
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                engine.addBar()
+                viewedBar = engine.barCount - 1   // jump to the new bar
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(.white.opacity(canAdd ? 0.55 : 0.18))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canAdd)
     }
 
     private var zoomControl: some View {
@@ -638,12 +612,11 @@ struct ContentView: View {
         } label: {
             Image(systemName: "minus.circle")
                 .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(.white.opacity(engine.barCount > 1 ? 0.55 : 0.18))
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .opacity(engine.barCount > 1 ? 1 : 0)
         .disabled(engine.barCount <= 1)
     }
 
