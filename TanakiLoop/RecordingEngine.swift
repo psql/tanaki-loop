@@ -7,13 +7,21 @@ private let log = Logger(subsystem: "com.altbizney.jammy", category: "audio")
 
 // MARK: - Track
 
-// A track IS a sample: one recorded sound + a row of step toggles.
+// A track IS a sample: one recorded sound + step toggles, one row per bar.
 struct Track: Identifiable, Equatable {
     let id: UUID = UUID()
     let colorIndex: Int   // stable — survives other tracks being removed
-    var steps: [Bool] = Array(repeating: false, count: LoopEngine.stepCount)
+    var steps: [[Bool]]   // [bar][step]
     var hasSample: Bool = false
     var sampleDuration: TimeInterval = 0
+
+    init(colorIndex: Int, bars: Int) {
+        self.colorIndex = colorIndex
+        self.steps = Array(repeating: Array(repeating: false, count: LoopEngine.stepCount),
+                           count: max(1, bars))
+    }
+
+    var hasAnySteps: Bool { steps.contains { $0.contains(true) } }
 }
 
 // MARK: - LoopEngine
@@ -22,15 +30,18 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
     static let stepCount = 16   // one bar of 4/4 at 16th-note resolution
     static let maxTracks = 8
+    static let maxBars   = 8
     static let minBPM: Double = 40
     static let maxBPM: Double = 240
 
     // MARK: - Published state
 
-    @Published private(set) var tracks:        [Track] = (0..<2).map { Track(colorIndex: $0) }
+    @Published private(set) var tracks:        [Track] = (0..<2).map { Track(colorIndex: $0, bars: 1) }
     @Published private(set) var isPlaying:     Bool    = false
     @Published private(set) var isRecording:   Bool    = false
-    @Published private(set) var currentStep:   Int     = 0
+    @Published private(set) var currentStep:   Int     = 0    // 0..<16, within the playing bar
+    @Published private(set) var currentBar:    Int     = 0
+    @Published private(set) var barCount:      Int     = 1
     @Published private(set) var bpm:           Double  = 120
     @Published private(set) var armedTrack:    Int     = 0
     @Published private(set) var fftMagnitudes: [Float] = [Float](repeating: 0, count: 64)
@@ -39,6 +50,8 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     @Published private(set) var countInEnabled: Bool   = false
     @Published private(set) var isCountingIn:   Bool   = false
     @Published private(set) var countInBeat:    Int    = 0    // 4,3,2,1 while counting in
+    @Published private(set) var canUndo:        Bool   = false
+    @Published private(set) var canRedo:        Bool   = false
 
     // MARK: - Audio engine
 
@@ -65,11 +78,12 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
     // Guarded by stateLock
     private var seqRunning:    Bool = false
-    private var nextStepIndex: Int = 0
+    private var nextStepIndex: Int = 0          // global: 0..<(stepCount * bars)
     private var bpmValue:      Double = 120
-    private var gridSnapshot:  [(id: UUID, steps: [Bool])] = []
+    private var barsValue:     Int = 1
+    private var gridSnapshot:  [(id: UUID, steps: [[Bool]])] = []
     private var lastStepDate:  Date = .distantPast
-    private var lastStepIndex: Int = 0
+    private var lastStepIndex: Int = 0          // global index
 
     private var stepInterval: TimeInterval { 60.0 / bpmValue / 4.0 }
 
@@ -676,15 +690,18 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     private func tick() {
         stateLock.lock()
         guard seqRunning else { stateLock.unlock(); return }
-        let stepIdx  = nextStepIndex
+        let total    = Self.stepCount * max(1, barsValue)
+        let global   = nextStepIndex % total
+        let bar      = global / Self.stepCount
+        let stepIdx  = global % Self.stepCount
         let snapshot = gridSnapshot
         let metroOn  = metronomeEnabled
-        for (id, steps) in snapshot where stepIdx < steps.count && steps[stepIdx] {
+        for (id, steps) in snapshot where bar < steps.count && steps[bar][stepIdx] {
             triggerLocked(id: id)
         }
         lastStepDate  = Date()
-        lastStepIndex = stepIdx
-        nextStepIndex = (stepIdx + 1) % Self.stepCount
+        lastStepIndex = global
+        nextStepIndex = (global + 1) % total
         let interval  = stepInterval
         stateLock.unlock()
 
@@ -694,7 +711,10 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in self?.metronomeBeat = beat }
         }
 
-        DispatchQueue.main.async { [weak self] in self?.currentStep = stepIdx }
+        DispatchQueue.main.async { [weak self] in
+            self?.currentStep = stepIdx
+            self?.currentBar  = bar
+        }
 
         nextDeadline = nextDeadline + interval
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: seqQueue)
@@ -725,11 +745,110 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         stateLock.unlock()
     }
 
+    // MARK: - Undo / Redo
+
+    // Whole-project snapshots: tracks are value types and sample buffers are immutable
+    // once recorded, so a snapshot is cheap (copy-on-write arrays + buffer references).
+    private struct Snapshot {
+        let tracks:     [Track]
+        let barCount:   Int
+        let sampleBufs: [UUID: AVAudioPCMBuffer]
+    }
+    private var undoStack: [Snapshot] = []
+    private var redoStack: [Snapshot] = []
+
+    // Call on main before any undoable mutation.
+    private func pushUndo() {
+        undoStack.append(currentSnapshot())
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        updateUndoFlags()
+    }
+
+    private func currentSnapshot() -> Snapshot {
+        stateLock.lock()
+        let bufs = sampleBufs
+        stateLock.unlock()
+        return Snapshot(tracks: tracks, barCount: barCount, sampleBufs: bufs)
+    }
+
+    private func updateUndoFlags() {
+        canUndo = !undoStack.isEmpty
+        canRedo = !redoStack.isEmpty
+    }
+
+    func undo() {
+        guard let snap = undoStack.popLast() else { return }
+        redoStack.append(currentSnapshot())
+        restore(snap)
+        updateUndoFlags()
+    }
+
+    func redo() {
+        guard let snap = redoStack.popLast() else { return }
+        undoStack.append(currentSnapshot())
+        restore(snap)
+        updateUndoFlags()
+    }
+
+    private func restore(_ snap: Snapshot) {
+        stateLock.lock()
+        for node in playerNodes.values {
+            node.stop()
+            audioEngine.detach(node)
+        }
+        playerNodes.removeAll()
+        sampleBufs = snap.sampleBufs
+        stateLock.unlock()
+
+        tracks     = snap.tracks
+        barCount   = snap.barCount
+        armedTrack = min(armedTrack, tracks.count - 1)
+
+        for t in tracks where t.hasSample {
+            stateLock.lock()
+            let buf = sampleBufs[t.id]
+            stateLock.unlock()
+            guard let buf else { continue }
+            let node = AVAudioPlayerNode()
+            audioEngine.attach(node)
+            audioEngine.connect(node, to: trackMixer, format: buf.format)
+            stateLock.lock()
+            playerNodes[t.id] = node
+            stateLock.unlock()
+        }
+        syncGrid()
+    }
+
     // MARK: - Grid editing
 
-    func toggleStep(track: Int, step: Int) {
-        guard tracks.indices.contains(track), (0..<Self.stepCount).contains(step) else { return }
-        tracks[track].steps[step].toggle()
+    // Toggles a range of steps (one display cell at coarse resolutions covers several
+    // 16th steps): if any step in the range is on, the whole range clears; otherwise
+    // the first (musically aligned) step turns on.
+    func toggleSteps(track: Int, bar: Int, range: Range<Int>) {
+        guard tracks.indices.contains(track),
+              tracks[track].steps.indices.contains(bar),
+              range.lowerBound >= 0, range.upperBound <= Self.stepCount else { return }
+        pushUndo()
+        if tracks[track].steps[bar][range].contains(true) {
+            for i in range { tracks[track].steps[bar][i] = false }
+        } else {
+            tracks[track].steps[bar][range.lowerBound] = true
+        }
+        syncGrid()
+    }
+
+    // MARK: - Bars
+
+    // Adds a bar that starts as a copy of the current last bar, for every track.
+    func addBar() {
+        guard barCount < Self.maxBars else { return }
+        pushUndo()
+        for i in tracks.indices {
+            let lastBar = tracks[i].steps[barCount - 1]
+            tracks[i].steps.append(lastBar)
+        }
+        barCount += 1
         syncGrid()
     }
 
@@ -739,7 +858,8 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
     func addTrack() {
         guard tracks.count < Self.maxTracks else { return }
-        tracks.append(Track(colorIndex: nextColorIndex))
+        pushUndo()
+        tracks.append(Track(colorIndex: nextColorIndex, bars: barCount))
         nextColorIndex += 1
         armedTrack = tracks.count - 1
         syncGrid()
@@ -766,6 +886,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     // The last remaining track is kept but emptied — the grid never goes to zero rows.
     func removeTrack(_ index: Int) {
         guard tracks.indices.contains(index) else { return }
+        pushUndo()
         let id = tracks[index].id
         stateLock.lock()
         if let node = playerNodes[id] {
@@ -779,9 +900,31 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         if tracks.count > 1 {
             tracks.remove(at: index)
         } else {
-            tracks[index] = Track(colorIndex: tracks[index].colorIndex)
+            tracks[index] = Track(colorIndex: tracks[index].colorIndex, bars: barCount)
         }
         armedTrack = min(armedTrack, tracks.count - 1)
+        syncGrid()
+    }
+
+    // Clears a track's sample and steps but keeps the row (first stage of the
+    // two-stage trash: clear sample first, then a second press removes the row).
+    func clearTrack(_ index: Int) {
+        guard tracks.indices.contains(index) else { return }
+        pushUndo()
+        let id = tracks[index].id
+        stateLock.lock()
+        if let node = playerNodes[id] {
+            node.stop()
+            audioEngine.detach(node)
+        }
+        playerNodes.removeValue(forKey: id)
+        sampleBufs.removeValue(forKey: id)
+        stateLock.unlock()
+
+        tracks[index].steps = Array(
+            repeating: Array(repeating: false, count: Self.stepCount), count: barCount)
+        tracks[index].hasSample      = false
+        tracks[index].sampleDuration = 0
         syncGrid()
     }
 
@@ -790,6 +933,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     private func syncGrid() {
         stateLock.lock()
         gridSnapshot = tracks.map { ($0.id, $0.steps) }
+        barsValue    = barCount
         stateLock.unlock()
     }
 
@@ -911,12 +1055,13 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
             let stepDate = lastStepDate
             let stepIdx  = lastStepIndex
             let interval = stepInterval
+            let total    = Self.stepCount * max(1, barsValue)
             stateLock.unlock()
 
             let perceived = Date().addingTimeInterval(-outLat)
             let fracPos   = Double(stepIdx) + perceived.timeIntervalSince(stepDate) / interval
             let nearest   = Int(round(fracPos))
-            recordStartStep = ((nearest % Self.stepCount) + Self.stepCount) % Self.stepCount
+            recordStartStep = ((nearest % total) + total) % total   // global step index
 
             // deltaSec > 0 → tap landed after the boundary: back-date the capture so it
             // begins exactly at the step (the ring buffer holds the past). deltaSec < 0 →
@@ -999,6 +1144,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
         DispatchQueue.main.async { [weak self] in
             guard let self, let idx = self.tracks.firstIndex(where: { $0.id == trackID }) else { return }
+            self.pushUndo()
 
             // Recording replaces the track's sample: swap out the old node entirely
             // (the new buffer's format may differ if the route changed mid-session).
@@ -1023,11 +1169,15 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
 
             if let s = startStep {
                 // Recorded live: drop the sample into the grid at the quantized step.
-                self.tracks[idx].steps[s] = true
-            } else if !self.tracks[idx].steps.contains(true) {
+                let bar  = (s / Self.stepCount) % max(1, self.barCount)
+                let step = s % Self.stepCount
+                if self.tracks[idx].steps.indices.contains(bar) {
+                    self.tracks[idx].steps[bar][step] = true
+                }
+            } else if !self.tracks[idx].hasAnySteps {
                 // Recorded while paused into an empty row: default to the downbeat
                 // so hitting play makes sound.
-                self.tracks[idx].steps[0] = true
+                self.tracks[idx].steps[0][0] = true
             }
             self.syncGrid()
         }

@@ -47,9 +47,17 @@ struct ContentView: View {
     @State private var tapTimes: [Date] = []
     @State private var tapPulse: CGFloat = 1.0
 
+    // Bar paging
+    @State private var viewedBar = 0
+    @State private var pageDragX: CGFloat = 0
+
+    // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
+    @State private var displayRes = 1
+    @State private var resPinchFired = false
+
     var body: some View {
         ZStack {
-            Color(red: 0.09, green: 0.09, blue: 0.12).ignoresSafeArea()
+            Color.black.ignoresSafeArea()
 
             if engine.isRecording {
                 armedColor.opacity(0.30).ignoresSafeArea().transition(.opacity)
@@ -92,6 +100,10 @@ struct ContentView: View {
         .onChange(of: engine.countInBeat) { _, beat in
             guard beat > 0 else { return }
             metronomeBuzz(downbeat: beat == 4)
+        }
+        .onChange(of: engine.barCount) { _, count in
+            // Undo can shrink the bar count out from under the pager
+            if viewedBar > count - 1 { viewedBar = count - 1 }
         }
     }
 
@@ -195,7 +207,7 @@ struct ContentView: View {
 
     private var tapTempoOverlay: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.09).opacity(0.94)
+            Color.black.opacity(0.94)
                 .ignoresSafeArea()
                 .transition(.opacity)
 
@@ -297,30 +309,21 @@ struct ContentView: View {
 
     private var grid: some View {
         GeometryReader { geo in
-            let steps    = LoopEngine.stepCount
-            let beatGaps = CGFloat(steps / 4 - 1)
-            let cellW    = (geo.size.width - padWidth - padGap
-                            - cellGap * CGFloat(steps - 1) - beatGap * beatGaps) / CGFloat(steps)
+            let W = geo.size.width
 
-            ScrollViewReader { proxy in
+            VStack(spacing: 14) {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: rowGap) {
-                        ForEach(Array(engine.tracks.enumerated()), id: \.element.id) { ti, track in
-                            trackRow(ti: ti, track: track, cellW: cellW, rowH: trackRowH)
-                                .id(track.id)
-                        }
+                        barPager(W: W)
                         if engine.tracks.count < LoopEngine.maxTracks {
                             addTrackButton(rowH: trackRowH)
                         }
                     }
                     .padding(.vertical, 6)
                 }
-                .onChange(of: engine.tracks.count) { old, new in
-                    guard new > old, let last = engine.tracks.last else { return }
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo(last.id, anchor: .center)
-                    }
-                }
+                .scrollClipDisabled()   // let trigger pops escape the scroll bounds
+
+                pageIndicator
             }
         }
         .frame(maxHeight: gridMaxHeight)
@@ -328,19 +331,161 @@ struct ContentView: View {
 
     private var gridMaxHeight: CGFloat {
         let rows = CGFloat(engine.tracks.count) + (engine.tracks.count < LoopEngine.maxTracks ? 1 : 0)
-        return rows * trackRowH + (rows - 1) * rowGap + 12
+        return rows * trackRowH + (rows - 1) * rowGap + 12 + 30
     }
 
-    private func trackRow(ti: Int, track: Track, cellW: CGFloat, rowH: CGFloat) -> some View {
+    // MARK: - Bar pager
+
+    private func barPager(W: CGFloat) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(0..<engine.barCount, id: \.self) { bar in
+                barPage(bar: bar, W: W)
+                    .frame(width: W)
+            }
+            if engine.barCount < LoopEngine.maxBars {
+                ghostAddPage(W: W)
+                    .frame(width: W)
+            }
+        }
+        .frame(width: W, alignment: .leading)
+        .offset(x: -CGFloat(viewedBar) * W + pageDragX)
+        .contentShape(Rectangle())
+        .simultaneousGesture(pageDragGesture(W: W))
+        .simultaneousGesture(resolutionPinch)
+    }
+
+    private func barPage(bar: Int, W: CGFloat) -> some View {
+        let cells        = LoopEngine.stepCount / displayRes
+        let cellsPerBeat = max(1, 4 / displayRes)
+        let cellW        = (W - padWidth - padGap - cellGap * CGFloat(cells - 1)
+                            - (beatGap - cellGap) * 3) / CGFloat(cells)
+
+        return VStack(spacing: rowGap) {
+            ForEach(Array(engine.tracks.enumerated()), id: \.element.id) { ti, track in
+                trackRow(ti: ti, track: track, bar: bar,
+                         cells: cells, cellsPerBeat: cellsPerBeat, cellW: cellW, rowH: trackRowH)
+            }
+        }
+    }
+
+    // Peeks in from the right past the last bar; release past the threshold to create
+    // a new bar (a copy of the one you dragged from).
+    private func ghostAddPage(W: CGFloat) -> some View {
+        let n      = CGFloat(engine.tracks.count)
+        let height = n * trackRowH + (n - 1) * rowGap
+        let active = viewedBar == engine.barCount - 1 && pageDragX < -addBarThreshold(W: W)
+
+        return RoundedRectangle(cornerRadius: 14)
+            .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [7, 6]))
+            .foregroundStyle(active ? armedColor : .white.opacity(0.25))
+            .frame(height: max(height, trackRowH))
+            .overlay(
+                VStack(spacing: 6) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 26, weight: .bold))
+                    Text("NEW BAR")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                }
+                .foregroundStyle(active ? armedColor : .white.opacity(0.35))
+            )
+            .scaleEffect(active ? 1.0 : 0.94)
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: active)
+            .padding(.horizontal, 4)
+    }
+
+    private func addBarThreshold(W: CGFloat) -> CGFloat { W * 0.30 }
+
+    private func pageDragGesture(W: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 20)
+            .onChanged { v in
+                // Mostly-vertical drags belong to the track ScrollView
+                guard abs(v.translation.width) > abs(v.translation.height) || pageDragX != 0 else { return }
+                var dx = v.translation.width
+                let lastIdx = engine.barCount - 1
+                let canAdd  = engine.barCount < LoopEngine.maxBars
+                if viewedBar == 0 && dx > 0 { dx *= 0.35 }                      // rubber band at front
+                if viewedBar == lastIdx && dx < 0 && !canAdd { dx *= 0.35 }     // …and at the cap
+                pageDragX = dx
+            }
+            .onEnded { v in
+                let dx        = v.translation.width
+                let threshold = W * 0.22
+                let lastIdx   = engine.barCount - 1
+                let canAdd    = engine.barCount < LoopEngine.maxBars
+                var target    = viewedBar
+
+                if dx < -threshold {
+                    if viewedBar < lastIdx {
+                        target += 1
+                    } else if canAdd && dx < -addBarThreshold(W: W) {
+                        engine.addBar()
+                        triggerHaptic(.heavy)
+                        target += 1
+                    }
+                } else if dx > threshold && viewedBar > 0 {
+                    target -= 1
+                }
+
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                    viewedBar = target
+                    pageDragX = 0
+                }
+            }
+    }
+
+    private var resolutionPinch: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                guard !resPinchFired else { return }
+                if value > 1.35, displayRes > 1 {
+                    // Pinch out → zoom in → finer grid
+                    resPinchFired = true
+                    triggerHaptic(.light)
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { displayRes /= 2 }
+                } else if value < 0.72, displayRes < 4 {
+                    // Pinch in → zoom out → coarser grid (16ths preserved underneath)
+                    resPinchFired = true
+                    triggerHaptic(.light)
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { displayRes *= 2 }
+                }
+            }
+            .onEnded { _ in resPinchFired = false }
+    }
+
+    private var pageIndicator: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<engine.barCount, id: \.self) { bar in
+                ZStack {
+                    Circle()
+                        .fill(.white.opacity(bar == viewedBar ? 0.9 : 0.25))
+                        .frame(width: 7, height: 7)
+                    if engine.isPlaying && engine.currentBar == bar {
+                        Circle()
+                            .stroke(armedColor, lineWidth: 1.5)
+                            .frame(width: 13, height: 13)
+                    }
+                }
+                .frame(width: 18, height: 18)
+                .contentShape(Circle().scale(1.8))
+                .onTapGesture {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { viewedBar = bar }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func trackRow(ti: Int, track: Track, bar: Int,
+                          cells: Int, cellsPerBeat: Int, cellW: CGFloat, rowH: CGFloat) -> some View {
         let isArmed    = engine.armedTrack == ti
         let triggering = isTriggering(track)
 
         return HStack(spacing: padGap) {
             trackPad(ti: ti, track: track, rowH: rowH)
             HStack(spacing: cellGap) {
-                ForEach(0..<LoopEngine.stepCount, id: \.self) { step in
-                    stepCell(ti: ti, track: track, step: step, cellW: cellW, rowH: rowH)
-                        .padding(.trailing, step % 4 == 3 && step != LoopEngine.stepCount - 1 ? beatGap - cellGap : 0)
+                ForEach(0..<cells, id: \.self) { cell in
+                    stepCell(ti: ti, track: track, bar: bar, cell: cell, cellW: cellW, rowH: rowH)
+                        .padding(.trailing, (cell + 1) % cellsPerBeat == 0 && cell != cells - 1 ? beatGap - cellGap : 0)
                 }
             }
         }
@@ -364,8 +509,9 @@ struct ContentView: View {
 
     private func isTriggering(_ track: Track) -> Bool {
         engine.isPlaying && track.hasSample
-            && track.steps.indices.contains(engine.currentStep)
-            && track.steps[engine.currentStep]
+            && track.steps.indices.contains(engine.currentBar)
+            && track.steps[engine.currentBar].indices.contains(engine.currentStep)
+            && track.steps[engine.currentBar][engine.currentStep]
     }
 
     // Track pad: tap = arm + audition, long-press = delete track.
@@ -390,11 +536,16 @@ struct ContentView: View {
             }
     }
 
-    private func stepCell(ti: Int, track: Track, step: Int, cellW: CGFloat, rowH: CGFloat) -> some View {
-        let color      = trackColor(track.colorIndex)
-        let on         = track.steps[step]
-        let isPlayhead = engine.isPlaying && engine.currentStep == step
-        let isBeat     = step % 4 == 0
+    // One displayed cell covers `displayRes` 16th steps; finer-grained steps survive
+    // resolution changes and show as mini dots along the cell's bottom edge.
+    private func stepCell(ti: Int, track: Track, bar: Int, cell: Int, cellW: CGFloat, rowH: CGFloat) -> some View {
+        let color    = trackColor(track.colorIndex)
+        let range    = (cell * displayRes)..<((cell + 1) * displayRes)
+        let stepsRow = track.steps.indices.contains(bar) ? track.steps[bar] : []
+        let on       = !stepsRow.isEmpty && stepsRow[range].contains(true)
+        let isPlayhead = engine.isPlaying && engine.currentBar == bar
+            && range.contains(engine.currentStep)
+        let isBeat   = (cell * displayRes) % 4 == 0
 
         let fill: Color = on
             ? color.opacity(isPlayhead ? 1.0 : 0.82)
@@ -403,10 +554,22 @@ struct ContentView: View {
         return RoundedRectangle(cornerRadius: 4)
             .fill(fill)
             .frame(width: cellW, height: rowH)
+            .overlay(alignment: .bottom) {
+                if displayRes > 1 && on {
+                    HStack(spacing: 2.5) {
+                        ForEach(Array(range), id: \.self) { s in
+                            Circle()
+                                .fill(.white.opacity(stepsRow[s] ? 0.95 : 0.22))
+                                .frame(width: 3.5, height: 3.5)
+                        }
+                    }
+                    .padding(.bottom, 4)
+                }
+            }
             .contentShape(Rectangle())
             .onTapGesture {
                 triggerHaptic(.light)
-                engine.toggleStep(track: ti, step: step)
+                engine.toggleSteps(track: ti, bar: bar, range: range)
             }
     }
 
@@ -437,16 +600,23 @@ struct ContentView: View {
         ZStack {
             recordButton
 
-            HStack {
+            HStack(spacing: 0) {
                 deleteTrackButton
+                undoRedoButton(systemName: "arrow.uturn.backward", enabled: engine.canUndo) {
+                    engine.undo()
+                }
                 Spacer()
+                undoRedoButton(systemName: "arrow.uturn.forward", enabled: engine.canRedo) {
+                    engine.redo()
+                }
                 countInToggle
             }
-            .padding(.horizontal, 32)
+            .padding(.horizontal, 16)
         }
     }
 
-    // Deletes the armed track entirely (sample + row). Long-press on a track pad does the same.
+    // Two-stage delete: a track with a sample is cleared first (row stays);
+    // pressing again on the now-empty track removes the whole row.
     private var deleteTrackButton: some View {
         let armedHasSample = engine.tracks.indices.contains(engine.armedTrack)
             && engine.tracks[engine.armedTrack].hasSample
@@ -454,15 +624,33 @@ struct ContentView: View {
 
         return Button {
             triggerHaptic(.heavy)
-            engine.removeTrack(engine.armedTrack)
+            if armedHasSample {
+                engine.clearTrack(engine.armedTrack)
+            } else {
+                engine.removeTrack(engine.armedTrack)
+            }
         } label: {
             Image(systemName: "trash")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(canDelete ? armedColor.opacity(0.9) : .white.opacity(0.18))
-                .frame(width: 56, height: 56)
+                .frame(width: 50, height: 56)
         }
         .buttonStyle(.plain)
         .disabled(!canDelete)
+    }
+
+    private func undoRedoButton(systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            triggerHaptic(.light)
+            action()
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(.white.opacity(enabled ? 0.7 : 0.18))
+                .frame(width: 44, height: 56)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
     }
 
     // Count-in checkbox: when on, record gives a one-bar click count before capturing.
