@@ -862,14 +862,15 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         syncGrid()
     }
 
-    // Shuffle a single bar of one track: keep the number of active hits but scatter them
-    // to new random positions (shakes up the rhythm without changing density). An empty
-    // bar gets seeded with a few hits so shuffle always produces something.
+    // Shuffle a single bar of one track: scatter hits to new random positions AND drift
+    // the density a little (±3 hits) so it can add or thin out — not just move. The hit
+    // count is clamped to a musical range so repeated shuffles never empty or saturate it.
     func shufflePattern(track: Int, bar: Int) {
         guard tracks.indices.contains(track), tracks[track].steps.indices.contains(bar) else { return }
         pushUndo()
         let current = tracks[track].steps[bar].filter { $0 }.count
-        let hits    = current > 0 ? current : Int.random(in: 3...5)
+        let base    = current > 0 ? current : 4
+        let hits    = max(1, min(11, base + Int.random(in: -3...3)))
         let chosen  = Array(0..<Self.stepCount).shuffled().prefix(hits)
         var row     = Array(repeating: false, count: Self.stepCount)
         for p in chosen { row[p] = true }
