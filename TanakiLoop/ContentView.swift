@@ -30,7 +30,6 @@ private let trackRowMax: CGFloat = 40   // portrait cap
 private let trackRowMin: CGFloat = 15   // landscape floor
 private let pageIndicatorH: CGFloat = 30
 private let gridVSpacing:   CGFloat = 12
-private let recordDiam: CGFloat = 120
 
 // MARK: - ContentView
 
@@ -42,6 +41,9 @@ struct ContentView: View {
     #else
     private var isLandscape: Bool { false }
     #endif
+
+    // Record button shrinks in landscape to leave the short grid more room.
+    private var recordDiameter: CGFloat { isLandscape ? 92 : 120 }
 
     // Record button gesture state (Keezy: hold = record while held, tap = latch)
     @State private var btnPressed   = false
@@ -1065,8 +1067,9 @@ struct ContentView: View {
             // Radial input meter: bars bloom outward around the mic
             RadialMeterView(bins: engine.fftMagnitudes,
                             isRecording: engine.isRecording,
-                            tint: armedColor)
-                .frame(width: recordDiam + 64, height: recordDiam + 64)
+                            tint: armedColor,
+                            diameter: recordDiameter)
+                .frame(width: recordDiameter + 64, height: recordDiameter + 64)
                 .allowsHitTesting(false)
 
             Circle()
@@ -1075,12 +1078,12 @@ struct ContentView: View {
                         ? Color.white.opacity(0.14)
                         : Color(red: 0.18, green: 0.18, blue: 0.22)
                 )
-                .frame(width: recordDiam, height: recordDiam)
+                .frame(width: recordDiameter, height: recordDiameter)
 
             if !engine.isRecording {
                 Circle()
                     .stroke(armedColor.opacity(0.55), lineWidth: 2.5)
-                    .frame(width: recordDiam, height: recordDiam)
+                    .frame(width: recordDiameter, height: recordDiameter)
             }
 
             if engine.isRecording {
@@ -1100,7 +1103,7 @@ struct ContentView: View {
                     .animation(.easeInOut(duration: 0.25), value: engine.isPlaying)
             }
         }
-        .frame(width: recordDiam, height: recordDiam)
+        .frame(width: recordDiameter, height: recordDiameter)
         .animation(.spring(response: 0.22), value: engine.isRecording)
         .contentShape(Circle())
         .gesture(
@@ -1327,12 +1330,13 @@ struct RadialMeterView: View {
     let bins:        [Float]
     let isRecording: Bool
     let tint:        Color
+    let diameter:    CGFloat
 
     var body: some View {
         Canvas { ctx, size in
             let cx = size.width / 2, cy = size.height / 2
             let n  = bins.count
-            let r0 = recordDiam / 2 + 5
+            let r0 = diameter / 2 + 5
             let maxLen = size.width / 2 - r0 - 2
             let alphaScale = isRecording ? 0.85 : 0.45
 
