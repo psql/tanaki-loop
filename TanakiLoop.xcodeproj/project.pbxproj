@@ -9,22 +9,14 @@
 /* Begin PBXBuildFile section */
 		CAAA0000000000000000BB01 /* TanakiLoopApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA01 /* TanakiLoopApp.swift */; };
 		CAAA0000000000000000BB02 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA02 /* ContentView.swift */; };
-		CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA03 /* MetronomeEngine.swift */; };
-		CAAA0000000000000000BB06 /* Recording.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA06 /* Recording.swift */; };
 		CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA07 /* RecordingEngine.swift */; };
-		CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA08 /* RecordingsListView.swift */; };
-		CAAA0000000000000000BB09 /* TrimView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA09 /* TrimView.swift */; };
 		CAAA0000000000000000BB04 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CAAA0000000000000000AA04 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		CAAA0000000000000000AA01 /* TanakiLoopApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TanakiLoopApp.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		CAAA0000000000000000AA03 /* MetronomeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetronomeEngine.swift; sourceTree = "<group>"; };
-		CAAA0000000000000000AA06 /* Recording.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recording.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA07 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
-		CAAA0000000000000000AA08 /* RecordingsListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingsListView.swift; sourceTree = "<group>"; };
-		CAAA0000000000000000AA09 /* TrimView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrimView.swift; sourceTree = "<group>"; };
 		CAAA0000000000000000AA04 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		CAAA0000000000000000AA05 /* TanakiLoop.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TanakiLoop.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -53,11 +45,7 @@
 			children = (
 				CAAA0000000000000000AA01 /* TanakiLoopApp.swift */,
 				CAAA0000000000000000AA02 /* ContentView.swift */,
-				CAAA0000000000000000AA03 /* MetronomeEngine.swift */,
-				CAAA0000000000000000AA06 /* Recording.swift */,
 				CAAA0000000000000000AA07 /* RecordingEngine.swift */,
-				CAAA0000000000000000AA08 /* RecordingsListView.swift */,
-				CAAA0000000000000000AA09 /* TrimView.swift */,
 				CAAA0000000000000000AA04 /* Assets.xcassets */,
 			);
 			path = TanakiLoop;
@@ -142,11 +130,7 @@
 			files = (
 				CAAA0000000000000000BB01 /* TanakiLoopApp.swift in Sources */,
 				CAAA0000000000000000BB02 /* ContentView.swift in Sources */,
-				CAAA0000000000000000BB03 /* MetronomeEngine.swift in Sources */,
-				CAAA0000000000000000BB06 /* Recording.swift in Sources */,
 				CAAA0000000000000000BB07 /* RecordingEngine.swift in Sources */,
-				CAAA0000000000000000BB08 /* RecordingsListView.swift in Sources */,
-				CAAA0000000000000000BB09 /* TrimView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

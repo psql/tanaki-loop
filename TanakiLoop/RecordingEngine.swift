@@ -5,30 +5,89 @@ import OSLog
 
 private let log = Logger(subsystem: "com.altbizney.jammy", category: "audio")
 
-final class JammyEngine: ObservableObject, @unchecked Sendable {
+// MARK: - Track
+
+// A track IS a sample: one recorded sound + a row of step toggles.
+struct Track: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let colorIndex: Int   // stable — survives other tracks being removed
+    var steps: [Bool] = Array(repeating: false, count: LoopEngine.stepCount)
+    var hasSample: Bool = false
+    var sampleDuration: TimeInterval = 0
+}
+
+// MARK: - LoopEngine
+
+final class LoopEngine: ObservableObject, @unchecked Sendable {
+
+    static let stepCount = 16   // one bar of 4/4 at 16th-note resolution
+    static let maxTracks = 8
+    static let minBPM: Double = 40
+    static let maxBPM: Double = 240
 
     // MARK: - Published state
 
-    @Published private(set) var isPlaying:     Bool          = false
-    @Published private(set) var isRecording:   Bool          = false
-    @Published private(set) var isScrubbing:   Bool          = false
-    @Published private(set) var samples:       [Sample]      = []
-    @Published private(set) var fftMagnitudes: [Float]       = [Float](repeating: 0, count: 64)
-    @Published private(set) var loopDuration:  TimeInterval? = nil
-    @Published private(set) var loopPosition:  Double        = 0
+    @Published private(set) var tracks:        [Track] = (0..<2).map { Track(colorIndex: $0) }
+    @Published private(set) var isPlaying:     Bool    = false
+    @Published private(set) var isRecording:   Bool    = false
+    @Published private(set) var currentStep:   Int     = 0
+    @Published private(set) var bpm:           Double  = 120
+    @Published private(set) var armedTrack:    Int     = 0
+    @Published private(set) var fftMagnitudes: [Float] = [Float](repeating: 0, count: 64)
+    @Published private(set) var metronomeOn:   Bool    = false
+    @Published private(set) var metronomeBeat: Int     = -1   // 0–3, cycles every beat; 0 = downbeat
+    @Published private(set) var countInEnabled: Bool   = false
+    @Published private(set) var isCountingIn:   Bool   = false
+    @Published private(set) var countInBeat:    Int    = 0    // 4,3,2,1 while counting in
 
     // MARK: - Audio engine
 
-    private let audioEngine  = AVAudioEngine()
-    private var playerNodes: [UUID: AVAudioPlayerNode] = [:]
-    private var sampleBufs:  [UUID: AVAudioPCMBuffer]  = [:]
+    private let audioEngine = AVAudioEngine()
     private var inputTapInstalled = false
 
-    // MARK: - Loop clock
+    // All track players route through this submix so their output can be tapped for
+    // resampling. The metronome connects to the main mixer directly — clicks are
+    // never captured into recordings.
+    private let trackMixer = AVAudioMixerNode()
+    private var outputTapInstalled = false
 
-    private var positionTimer:  Timer?
-    private var loopStartDate:  Date?
-    private var pausedPosition: Double = 0
+    // Player nodes / sample buffers, keyed by track id.
+    // Guarded by stateLock — read from the sequencer queue, mutated on main.
+    private let stateLock = NSLock()
+    private var playerNodes: [UUID: AVAudioPlayerNode] = [:]
+    private var sampleBufs:  [UUID: AVAudioPCMBuffer]  = [:]
+
+    // MARK: - Sequencer
+
+    private let seqQueue = DispatchQueue(label: "com.altbizney.jammy.sequencer", qos: .userInteractive)
+    private var stepTimer: DispatchSourceTimer?
+    private var nextDeadline: DispatchTime = .now()
+
+    // Guarded by stateLock
+    private var seqRunning:    Bool = false
+    private var nextStepIndex: Int = 0
+    private var bpmValue:      Double = 120
+    private var gridSnapshot:  [(id: UUID, steps: [Bool])] = []
+    private var lastStepDate:  Date = .distantPast
+    private var lastStepIndex: Int = 0
+
+    private var stepInterval: TimeInterval { 60.0 / bpmValue / 4.0 }
+
+    // MARK: - Metronome
+
+    private let metroNode = AVAudioPlayerNode()
+    private var metroAccentBuf: AVAudioPCMBuffer?
+    private var metroTickBuf:   AVAudioPCMBuffer?
+    private var metroTimer: DispatchSourceTimer?          // standalone clock (seqQueue only)
+    private var metroDeadline: DispatchTime = .now()      // seqQueue only
+    private var metroBeatCount = 0                        // seqQueue only
+    private var metronomeEnabled = false                  // guarded by stateLock
+
+    // Count-in (seqQueue only)
+    private var countTimer: DispatchSourceTimer?
+    private var countDeadline: DispatchTime = .now()
+    private var countRemaining = 0
+    private var countActive = false
 
     // MARK: - Ring buffer (always-on mic capture, ~60 s at 48 kHz)
 
@@ -37,6 +96,12 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
     private var ringWritePos: Int = 0      // audio thread writes; Int is word-atomic on arm64
     private var captureStartPos: Int = 0
     private var captureFormat:   AVAudioFormat?
+
+    // Playback ring buffer (track-submix output) — mixed into recordings for resampling.
+    private var outRing        = [Float](repeating: 0, count: 48_000 * 60)
+    private var outWritePos:   Int    = 0
+    private var outCaptureStart: Int  = 0
+    private var outSampleRate: Double = 0
 
     // AudioQueue fallback — used when AVAudioEngine inputNode reports sr=0 (iOS 26 USB "Other" bug)
     private var inputQueue:          AudioQueueRef? = nil
@@ -55,15 +120,8 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // MARK: - Recording
 
-    private var recordingPhase: Double = 0
-    private var hasAnyLoop:     Bool   = false
-
-    // MARK: - Scrub
-
-    private var wasPlayingBeforeScrub = false
-    private var throwTimer:           Timer?
-    private var lastScrubChunkPos:    Double = -1
-    private var lastScrubChunkDate:   Date   = .distantPast
+    private var recordTrackID:   UUID? = nil
+    private var recordStartStep: Int?  = nil   // quantized grid step when recording started while playing
 
     // MARK: - Init
 
@@ -75,6 +133,8 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         setupAudioSession()
         fftSetup = vDSP_create_fftsetup(vDSP_Length(10), FFTRadix(kFFTRadix2))
         vDSP_hann_window(&fftWindow, vDSP_Length(fftN), Int32(vDSP_HANN_DENORM))
+        setupMetronome()
+        syncGrid()
         #if os(iOS)
         AVAudioSession.sharedInstance().requestRecordPermission { _ in }
         routeObserver = NotificationCenter.default.addObserver(
@@ -155,15 +215,27 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
 
     // AVAudioEngine posts this when hardware configuration changes and stops the engine.
     // Reconnect all player nodes (graph connections are invalidated) and restart.
+    // The sequencer clock keeps running independently — triggers resume at the next step.
     private func handleEngineConfigChange() {
-        let wasPlaying = isPlaying
         teardownInputTap()
+        if outputTapInstalled {
+            trackMixer.removeTap(onBus: 0)
+            outputTapInstalled = false
+        }
+        stateLock.lock()
+        audioEngine.attach(trackMixer)
+        audioEngine.connect(trackMixer, to: audioEngine.mainMixerNode, format: nil)
         for (id, node) in playerNodes {
             guard let buf = sampleBufs[id] else { continue }
             audioEngine.attach(node)
-            audioEngine.connect(node, to: audioEngine.mainMixerNode, format: buf.format)
+            audioEngine.connect(node, to: trackMixer, format: buf.format)
         }
-        guard wasPlaying || isRecording else { return }
+        audioEngine.attach(metroNode)
+        if let fmt = metroAccentBuf?.format {
+            audioEngine.connect(metroNode, to: audioEngine.mainMixerNode, format: fmt)
+        }
+        stateLock.unlock()
+        guard isPlaying || isRecording || metronomeOn else { return }
         audioEngine.prepare()
         do {
             try audioEngine.start()
@@ -172,40 +244,21 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
             return
         }
         installInputTap()
-        if wasPlaying { rescheduleAndPlay() }
-    }
-
-    // Reschedule all sample buffers from the current loop position and resume playback.
-    private func rescheduleAndPlay() {
-        guard let dur = loopDuration, dur > 0 else { return }
-        let pos: Double
-        if let start = loopStartDate {
-            pos = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
-        } else {
-            pos = pausedPosition
-        }
-        for sample in samples {
-            guard let node = playerNodes[sample.id],
-                  let buf  = sampleBufs[sample.id] else { continue }
-            let distance   = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let frameOff   = AVAudioFrameCount(distance * Double(buf.frameLength))
-            let tailFrames = buf.frameLength > frameOff ? buf.frameLength - frameOff : 0
-            scheduleFromOffset(node: node, buf: buf, frameOffset: frameOff, tailFrames: tailFrames)
-            node.play()
-        }
-        isPlaying     = true
-        loopStartDate = Date().addingTimeInterval(-pos * dur)
-        startPositionTimer()
+        installOutputTapIfNeeded()
     }
 
     // MARK: - Engine lifecycle
 
     private func startEngineIfNeeded() {
-        guard !audioEngine.isRunning else { return }
+        guard !audioEngine.isRunning else {
+            installOutputTapIfNeeded()
+            return
+        }
         audioEngine.prepare()
         do {
             try audioEngine.start()
             installInputTap()
+            installOutputTapIfNeeded()
         } catch { print("Engine error: \(error)") }
     }
 
@@ -322,7 +375,7 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         let aqCallback: AudioQueueInputCallback = { userData, queue, buffer, _, numPackets, _ in
             defer { AudioQueueEnqueueBuffer(queue, buffer, 0, nil) }
             guard let userData, numPackets > 0 else { return }
-            let engine    = Unmanaged<JammyEngine>.fromOpaque(userData).takeUnretainedValue()
+            let engine    = Unmanaged<LoopEngine>.fromOpaque(userData).takeUnretainedValue()
             let ch        = engine.aqChannels
             let byteCount = Int(buffer.pointee.mAudioDataByteSize)
             let frames    = byteCount / (ch * 4)
@@ -437,340 +490,313 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         DispatchQueue.main.async { self.fftMagnitudes = result }
     }
 
-    // MARK: - Playback
+    // MARK: - Transport
 
     func togglePlayback() {
-        guard !isScrubbing else { return }
-        if isPlaying { pausePlayback() } else { resumePlayback() }
+        if isPlaying { pause() } else { play() }
     }
 
-    private func pausePlayback() {
-        guard isPlaying else { return }
-        pausedPosition = loopPosition
-        positionTimer?.invalidate(); positionTimer = nil
-        loopStartDate = nil
-        playerNodes.values.forEach { $0.pause() }
-        isPlaying = false
-    }
-
-    private func resumePlayback() {
-        guard !isPlaying, !samples.isEmpty else { return }
-        if let dur = loopDuration {
-            loopStartDate = Date().addingTimeInterval(-pausedPosition * dur)
-        }
-        playerNodes.values.forEach { $0.play() }
-        isPlaying = true
-        startPositionTimer()
-    }
-
-    private func beginLoop() {
-        if loopStartDate == nil { loopStartDate = Date() }
+    private func play() {
         guard !isPlaying else { return }
+        startEngineIfNeeded()
         isPlaying = true
-        startPositionTimer()
-    }
-
-    private func stopLoop() {
-        positionTimer?.invalidate(); positionTimer = nil
-        loopStartDate  = nil
-        playerNodes.values.forEach { $0.stop() }
-        isPlaying      = false
-        loopPosition   = 0
-        pausedPosition = 0
-    }
-
-    private func startPositionTimer() {
-        positionTimer?.invalidate()
-        positionTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self, let dur = self.loopDuration,
-                  let start = self.loopStartDate, dur > 0 else { return }
-            self.loopPosition = Date().timeIntervalSince(start)
-                .truncatingRemainder(dividingBy: dur) / dur
+        updatePlaybackVolume()
+        stateLock.lock()
+        seqRunning = true
+        stateLock.unlock()
+        seqQueue.async { [weak self] in
+            guard let self else { return }
+            // The sequencer clock drives metronome beats while playing.
+            self.metroTimer?.cancel()
+            self.metroTimer = nil
+            self.nextDeadline = .now()
+            self.tick()
         }
     }
 
-    // MARK: - Scrub
-
-    func beginScrub() {
-        guard !samples.isEmpty, !isRecording else { return }
-        wasPlayingBeforeScrub = isPlaying
-        isScrubbing           = true
-        positionTimer?.invalidate(); positionTimer = nil
-        loopStartDate         = nil
-        lastScrubChunkPos     = -1
-        lastScrubChunkDate    = .distantPast
+    private func pause() {
+        guard isPlaying else { return }
+        isPlaying = false
+        stateLock.lock()
+        seqRunning = false
+        let metroOn = metronomeEnabled
+        let nodes = Array(playerNodes.values)
+        stateLock.unlock()
+        seqQueue.async { [weak self] in
+            guard let self else { return }
+            self.stepTimer?.cancel()
+            self.stepTimer = nil
+            nodes.forEach { $0.stop() }   // silence ringing tails
+            if metroOn { self.startStandaloneMetronomeOnSeqQueue() }
+        }
     }
 
-    func scrubTo(position: Double) {
-        var pos = position.truncatingRemainder(dividingBy: 1.0)
-        if pos < 0 { pos += 1 }
-        loopPosition   = pos
-        pausedPosition = pos
-        updateScrubChunks(at: pos)
+    // MARK: - Metronome
+
+    private func setupMetronome() {
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2) else { return }
+        metroAccentBuf = synthesizeClick(format: fmt, frequency: 1250, duration: 0.06, amplitude: 0.60)
+        metroTickBuf   = synthesizeClick(format: fmt, frequency: 850,  duration: 0.05, amplitude: 0.42)
+        audioEngine.attach(metroNode)
+        audioEngine.connect(metroNode, to: audioEngine.mainMixerNode, format: fmt)
+        audioEngine.attach(trackMixer)
+        audioEngine.connect(trackMixer, to: audioEngine.mainMixerNode, format: nil)
     }
 
-    func endScrub(velocityLoopsPerSec: Double) {
-        throwTimer?.invalidate()
-        if abs(velocityLoopsPerSec) > 0.05 {
-            var vel = velocityLoopsPerSec
-            throwTimer = Timer.scheduledTimer(withTimeInterval: 1 / 60, repeats: true) { [weak self] timer in
-                guard let self else { timer.invalidate(); return }
-                vel *= 0.96
-                if abs(vel) < 0.003 { timer.invalidate(); self.finishScrub(); return }
-                var p = self.loopPosition + vel / 60
-                p = p.truncatingRemainder(dividingBy: 1.0)
-                if p < 0 { p += 1 }
-                self.loopPosition   = p
-                self.pausedPosition = p
-                self.updateScrubChunks(at: p)
+    // MARK: - Output tap (resampling)
+
+    private func installOutputTapIfNeeded() {
+        guard !outputTapInstalled else { return }
+        let fmt = trackMixer.outputFormat(forBus: 0)
+        guard fmt.sampleRate > 0 else { return }
+        outSampleRate = fmt.sampleRate
+        trackMixer.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buffer, _ in
+            self?.processOutputTapBuffer(buffer)
+        }
+        outputTapInstalled = true
+        log.info("installOutputTap: ✓ sr=\(fmt.sampleRate)")
+    }
+
+    private func processOutputTapBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let chData = buffer.floatChannelData else { return }
+        let n       = Int(buffer.frameLength)
+        let chCount = Int(buffer.format.channelCount)
+        let ch0     = chData[0]
+        let ch1: UnsafeMutablePointer<Float>? = chCount > 1 ? chData[1] : nil
+        let cap = ringCapacity
+        for i in 0..<n {
+            outRing[outWritePos % cap] = ch1 != nil ? (ch0[i] + ch1![i]) * 0.5 : ch0[i]
+            outWritePos += 1
+        }
+    }
+
+    // Sum the playback ring into a freshly drained mic buffer (sample rates must match;
+    // with a mismatched route the playback layer is skipped rather than pitch-shifted).
+    private func mixOutputIntoBuffer(_ buf: AVAudioPCMBuffer, outStart: Int, outEnd: Int) {
+        guard let fmt = captureFormat,
+              outSampleRate > 0, abs(outSampleRate - fmt.sampleRate) < 1.0,
+              let dst = buf.floatChannelData?[0] else { return }
+        let n = min(Int(buf.frameLength), outEnd - outStart)
+        guard n > 0 else { return }
+        outRing.withUnsafeBufferPointer { rb in
+            let ptr = rb.baseAddress!
+            var si  = ((outStart % ringCapacity) + ringCapacity) % ringCapacity
+            for i in 0..<n {
+                dst[i] = max(-1.0, min(1.0, dst[i] + ptr[si]))
+                si += 1
+                if si == ringCapacity { si = 0 }
+            }
+        }
+    }
+
+    // Friendly woodblock-ish click: short sine burst with a fast exponential decay.
+    private func synthesizeClick(format: AVAudioFormat, frequency: Double,
+                                 duration: Double, amplitude: Float) -> AVAudioPCMBuffer? {
+        let sr     = format.sampleRate
+        let frames = AVAudioFrameCount(sr * duration)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+              let ch  = buf.floatChannelData else { return nil }
+        buf.frameLength = frames
+        for c in 0..<Int(format.channelCount) {
+            for i in 0..<Int(frames) {
+                let t = Double(i) / sr
+                ch[c][i] = Float(sin(2 * .pi * frequency * t) * exp(-t * 34.0)) * amplitude
+            }
+        }
+        return buf
+    }
+
+    func toggleMetronome() {
+        metronomeOn.toggle()
+        let on = metronomeOn
+        stateLock.lock()
+        metronomeEnabled = on
+        let playing = seqRunning
+        stateLock.unlock()
+
+        if on {
+            startEngineIfNeeded()
+            // While playing, the sequencer clock emits the beats; standalone clock
+            // only needed when the transport is stopped.
+            if !playing {
+                seqQueue.async { [weak self] in self?.startStandaloneMetronomeOnSeqQueue() }
             }
         } else {
-            finishScrub()
-        }
-    }
-
-    private func finishScrub() {
-        isScrubbing       = false
-        throwTimer?.invalidate(); throwTimer = nil
-        lastScrubChunkPos = -1
-        let pos           = pausedPosition
-
-        for sample in samples {
-            guard let node = playerNodes[sample.id],
-                  let buf  = sampleBufs[sample.id] else { continue }
-            node.stop()
-            let distance    = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let frameOffset = AVAudioFrameCount(distance * Double(buf.frameLength))
-            let tailFrames  = buf.frameLength > frameOffset ? buf.frameLength - frameOffset : 0
-            scheduleFromOffset(node: node, buf: buf, frameOffset: frameOffset, tailFrames: tailFrames)
-            if wasPlayingBeforeScrub { node.play() }
-        }
-
-        if wasPlayingBeforeScrub, let dur = loopDuration {
-            loopStartDate = Date().addingTimeInterval(-pos * dur)
-            isPlaying     = true
-            startPositionTimer()
-        }
-    }
-
-    private func updateScrubChunks(at pos: Double) {
-        let now = Date()
-        guard abs(pos - lastScrubChunkPos) > 0.008 ||
-              now.timeIntervalSince(lastScrubChunkDate) > 0.07 else { return }
-        lastScrubChunkPos  = pos
-        lastScrubChunkDate = now
-        let chunkSecs: Double = 0.07
-        for sample in samples {
-            guard let node = playerNodes[sample.id],
-                  let buf  = sampleBufs[sample.id] else { continue }
-            let dist   = (pos - sample.phaseOffset + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let start  = AVAudioFrameCount(dist * Double(buf.frameLength))
-            let cap    = AVAudioFrameCount(chunkSecs * buf.format.sampleRate)
-            let avail  = buf.frameLength > start ? buf.frameLength - start : 0
-            let frames = min(cap, avail)
-            guard frames > 100,
-                  let chunk = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: frames),
-                  let src = buf.floatChannelData, let dst = chunk.floatChannelData else { continue }
-            chunk.frameLength = frames
-            for c in 0..<Int(buf.format.channelCount) {
-                memcpy(dst[c], src[c].advanced(by: Int(start)),
-                       Int(frames) * MemoryLayout<Float>.size)
+            seqQueue.async { [weak self] in
+                self?.metroTimer?.cancel()
+                self?.metroTimer = nil
             }
-            node.stop()
-            node.scheduleBuffer(chunk, at: nil, options: .loops, completionHandler: nil)
-            node.play()
+            DispatchQueue.main.async { [weak self] in self?.metronomeBeat = -1 }
         }
     }
 
-    // MARK: - Loop length scaling
-
-    // Fine-tune loop duration by a small delta (positive = longer, negative = shorter).
-    // For trim (shorter): shrinks frameLength in-place so the looping player picks up the
-    // new boundary on its next iteration — no stop, no audible gap.
-    // For extend (longer): must stop + reschedule to load the padded buffer.
-    func trimLoop(delta: TimeInterval) {
-        guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
-        let newDur = max(0.10, dur + delta)
-        guard abs(newDur - dur) > 0.0005 else { return }
-
-        let rawElapsed = currentRawElapsed(within: dur)
-        let clampedElapsed = rawElapsed.truncatingRemainder(dividingBy: newDur)
-
-        // Update timing state (no stop needed for trim path)
-        loopDuration   = newDur
-        loopStartDate  = Date().addingTimeInterval(-clampedElapsed)
-        pausedPosition = clampedElapsed / newDur
-
-        var needsStop = false
-        for i in 0..<samples.count {
-            let id = samples[i].id
-            guard let buf = sampleBufs[id] else { continue }
-            let targetFrames = AVAudioFrameCount(newDur * buf.format.sampleRate)
-            samples[i].duration = newDur
-            if targetFrames <= buf.frameLength {
-                // Trim: shrink in-place. The playing node detects the new loop boundary
-                // on its next loop iteration — continuous, no click.
-                buf.frameLength = max(targetFrames, 1)
-            } else {
-                // Extend: need a new padded buffer, requires stop + reschedule.
-                let finalBuf = padBuffer(buf, toDuration: newDur) ?? buf
-                sampleBufs[id] = finalBuf
-                needsStop = true
-            }
-        }
-
-        if needsStop {
-            let wasPlaying = isPlaying
-            playerNodes.values.forEach { $0.stop() }
-            isPlaying = false
-            positionTimer?.invalidate(); positionTimer = nil
-            for i in 0..<samples.count {
-                let id = samples[i].id
-                guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
-                let phase      = samples[i].phaseOffset
-                let distance   = (clampedElapsed / newDur - phase + 1.0).truncatingRemainder(dividingBy: 1.0)
-                let frameOff   = AVAudioFrameCount(distance * Double(buf.frameLength))
-                let tailFrames = buf.frameLength > frameOff ? buf.frameLength - frameOff : 0
-                scheduleFromOffset(node: node, buf: buf, frameOffset: frameOff, tailFrames: tailFrames)
-            }
-            if wasPlaying {
-                playerNodes.values.forEach { $0.play() }
-                isPlaying = true
-                startPositionTimer()
-            }
-        }
+    private func startStandaloneMetronomeOnSeqQueue() {
+        metroTimer?.cancel()
+        metroBeatCount = 0
+        metroDeadline  = .now()
+        metroTick()
     }
 
-    func doubleLoopLength() {
-        guard let dur = loopDuration, !samples.isEmpty, !isRecording, !isScrubbing else { return }
-        let newDur     = dur * 2
-        let rawElapsed = currentRawElapsed(within: dur)
-        let wasPlaying = isPlaying
-        playerNodes.values.forEach { $0.stop() }
-        isPlaying = false
-        positionTimer?.invalidate(); positionTimer = nil
-
-        for i in 0..<samples.count {
-            let id = samples[i].id
-            guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
-            let nFrames = buf.frameLength * 2
-            guard let newBuf = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: nFrames),
-                  let src = buf.floatChannelData, let dst = newBuf.floatChannelData else { continue }
-            newBuf.frameLength = nFrames
-            let ch         = Int(buf.format.channelCount)
-            let frameBytes = Int(buf.frameLength) * MemoryLayout<Float>.size
-            for c in 0..<ch {
-                memcpy(dst[c], src[c], frameBytes)
-                memcpy(dst[c].advanced(by: Int(buf.frameLength)), src[c], frameBytes)
-            }
-            sampleBufs[id]         = newBuf
-            let newPhase           = samples[i].phaseOffset / 2.0
-            samples[i].phaseOffset = newPhase
-            samples[i].duration    = newDur
-            let distance   = (rawElapsed / newDur - newPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let frameOff   = AVAudioFrameCount(distance * Double(nFrames))
-            let tailFrames = nFrames > frameOff ? nFrames - frameOff : 0
-            scheduleFromOffset(node: node, buf: newBuf, frameOffset: frameOff, tailFrames: tailFrames)
-        }
-
-        loopDuration   = newDur
-        loopStartDate  = Date().addingTimeInterval(-rawElapsed)
-        pausedPosition = rawElapsed / newDur
-        if wasPlaying {
-            playerNodes.values.forEach { $0.play() }
-            isPlaying = true
-            startPositionTimer()
-        }
-    }
-
-    func halveLoopLength() {
-        guard let dur = loopDuration, dur > 0.4, !samples.isEmpty, !isRecording, !isScrubbing else { return }
-        let newDur     = dur / 2
-        let rawElapsed = currentRawElapsed(within: newDur)
-        let wasPlaying = isPlaying
-        playerNodes.values.forEach { $0.stop() }
-        isPlaying = false
-        positionTimer?.invalidate(); positionTimer = nil
-
-        for i in 0..<samples.count {
-            let id = samples[i].id
-            guard let buf = sampleBufs[id], let node = playerNodes[id] else { continue }
-            buf.frameLength    = buf.frameLength / 2
-            let nFrames        = buf.frameLength
-            let newPhase       = (samples[i].phaseOffset * 2.0).truncatingRemainder(dividingBy: 1.0)
-            samples[i].phaseOffset = newPhase
-            samples[i].duration    = newDur
-            let distance   = (rawElapsed / newDur - newPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let frameOff   = AVAudioFrameCount(distance * Double(nFrames))
-            let tailFrames = nFrames > frameOff ? nFrames - frameOff : 0
-            scheduleFromOffset(node: node, buf: buf, frameOffset: frameOff, tailFrames: tailFrames)
-        }
-
-        loopDuration   = newDur
-        loopStartDate  = Date().addingTimeInterval(-rawElapsed)
-        pausedPosition = rawElapsed / newDur
-        if wasPlaying {
-            playerNodes.values.forEach { $0.play() }
-            isPlaying = true
-            startPositionTimer()
-        }
-    }
-
-    private func currentRawElapsed(within period: TimeInterval) -> TimeInterval {
-        if let start = loopStartDate {
-            return Date().timeIntervalSince(start).truncatingRemainder(dividingBy: period)
-        }
-        return (pausedPosition * (loopDuration ?? period)).truncatingRemainder(dividingBy: period)
-    }
-
-    private func scheduleFromOffset(node: AVAudioPlayerNode, buf: AVAudioPCMBuffer,
-                                    frameOffset: AVAudioFrameCount, tailFrames: AVAudioFrameCount) {
-        guard tailFrames > 0, frameOffset > 0,
-              let tailBuf = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: tailFrames),
-              let srcCh   = buf.floatChannelData,
-              let dstCh   = tailBuf.floatChannelData
-        else {
-            node.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
+    // Standalone metronome clock — same drift-free pattern as the sequencer tick.
+    private func metroTick() {
+        stateLock.lock()
+        let enabled  = metronomeEnabled && !seqRunning
+        let interval = 60.0 / bpmValue
+        stateLock.unlock()
+        guard enabled else {
+            metroTimer?.cancel()
+            metroTimer = nil
             return
         }
-        tailBuf.frameLength = tailFrames
-        let ch = Int(buf.format.channelCount)
-        for c in 0..<ch {
-            memcpy(dstCh[c], srcCh[c].advanced(by: Int(frameOffset)),
-                   Int(tailFrames) * MemoryLayout<Float>.size)
+
+        let beat = metroBeatCount % 4
+        metroBeatCount += 1
+        playClick(downbeat: beat == 0)
+        DispatchQueue.main.async { [weak self] in self?.metronomeBeat = beat }
+
+        metroDeadline = metroDeadline + interval
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: seqQueue)
+        timer.schedule(deadline: metroDeadline, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.metroTick() }
+        timer.resume()
+        metroTimer = timer
+    }
+
+    private func playClick(downbeat: Bool) {
+        guard audioEngine.isRunning,
+              let buf = downbeat ? metroAccentBuf : metroTickBuf else { return }
+        metroNode.scheduleBuffer(buf, at: nil, completionHandler: nil)
+        metroNode.play()
+    }
+
+    // MARK: - Sequencer clock
+
+    // Runs on seqQueue. Drift-free: the next deadline accumulates from the previous one,
+    // and the interval is re-read each step so live tempo changes take effect immediately.
+    private func tick() {
+        stateLock.lock()
+        guard seqRunning else { stateLock.unlock(); return }
+        let stepIdx  = nextStepIndex
+        let snapshot = gridSnapshot
+        let metroOn  = metronomeEnabled
+        for (id, steps) in snapshot where stepIdx < steps.count && steps[stepIdx] {
+            triggerLocked(id: id)
         }
-        node.scheduleBuffer(tailBuf, at: nil, completionHandler: nil)
-        node.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
+        lastStepDate  = Date()
+        lastStepIndex = stepIdx
+        nextStepIndex = (stepIdx + 1) % Self.stepCount
+        let interval  = stepInterval
+        stateLock.unlock()
+
+        if metroOn && stepIdx % 4 == 0 {
+            playClick(downbeat: stepIdx == 0)
+            let beat = stepIdx / 4
+            DispatchQueue.main.async { [weak self] in self?.metronomeBeat = beat }
+        }
+
+        DispatchQueue.main.async { [weak self] in self?.currentStep = stepIdx }
+
+        nextDeadline = nextDeadline + interval
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: seqQueue)
+        timer.schedule(deadline: nextDeadline, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+        stepTimer = timer
     }
 
-    // MARK: - Undo / Clear
-
-    func undo() {
-        guard !samples.isEmpty else { return }
-        let removed = samples.removeLast()
-        if let node = playerNodes[removed.id] { node.stop(); audioEngine.detach(node) }
-        playerNodes.removeValue(forKey: removed.id)
-        sampleBufs.removeValue(forKey: removed.id)
-        try? FileManager.default.removeItem(at: removed.url)
-        if samples.isEmpty { loopDuration = nil; hasAnyLoop = false; stopLoop() }
+    // Monophonic retrigger: stop() cuts whatever this track is still playing,
+    // then the sample restarts from the top. Must be called with stateLock held.
+    private func triggerLocked(id: UUID) {
+        guard audioEngine.isRunning,
+              let node = playerNodes[id],
+              let buf  = sampleBufs[id] else { return }
+        node.stop()
+        node.scheduleBuffer(buf, at: nil, completionHandler: nil)
+        node.play()
     }
 
-    func clearAll() {
-        throwTimer?.invalidate(); throwTimer = nil
-        isScrubbing  = false
-        stopLoop()
-        loopDuration = nil
-        hasAnyLoop   = false
-        for node in playerNodes.values { node.stop(); audioEngine.detach(node) }
-        playerNodes.removeAll(); sampleBufs.removeAll()
-        samples.forEach { try? FileManager.default.removeItem(at: $0.url) }
-        samples.removeAll()
+    // MARK: - Tempo
+
+    func setBPM(_ newBPM: Double) {
+        let clamped = max(Self.minBPM, min(Self.maxBPM, newBPM))
+        bpm = clamped
+        stateLock.lock()
+        bpmValue = clamped
+        stateLock.unlock()
+    }
+
+    // MARK: - Grid editing
+
+    func toggleStep(track: Int, step: Int) {
+        guard tracks.indices.contains(track), (0..<Self.stepCount).contains(step) else { return }
+        tracks[track].steps[step].toggle()
+        syncGrid()
+    }
+
+    // MARK: - Track management
+
+    private var nextColorIndex = 2   // first two are taken by the initial tracks
+
+    func addTrack() {
+        guard tracks.count < Self.maxTracks else { return }
+        tracks.append(Track(colorIndex: nextColorIndex))
+        nextColorIndex += 1
+        armedTrack = tracks.count - 1
+        syncGrid()
+    }
+
+    // Arm the track for recording; if it already holds a sample, audition it (Keezy pad feel).
+    func selectTrack(_ index: Int) {
+        guard tracks.indices.contains(index) else { return }
+        armedTrack = index
+        guard tracks[index].hasSample else { return }
+        startEngineIfNeeded()
+        stateLock.lock()
+        triggerLocked(id: tracks[index].id)
+        stateLock.unlock()
+    }
+
+    // Arm without auditioning (e.g. long-press on a row).
+    func armTrack(_ index: Int) {
+        guard tracks.indices.contains(index) else { return }
+        armedTrack = index
+    }
+
+    // Removes the whole track (sample, steps, and the row itself).
+    // The last remaining track is kept but emptied — the grid never goes to zero rows.
+    func removeTrack(_ index: Int) {
+        guard tracks.indices.contains(index) else { return }
+        let id = tracks[index].id
+        stateLock.lock()
+        if let node = playerNodes[id] {
+            node.stop()
+            audioEngine.detach(node)
+        }
+        playerNodes.removeValue(forKey: id)
+        sampleBufs.removeValue(forKey: id)
+        stateLock.unlock()
+
+        if tracks.count > 1 {
+            tracks.remove(at: index)
+        } else {
+            tracks[index] = Track(colorIndex: tracks[index].colorIndex)
+        }
+        armedTrack = min(armedTrack, tracks.count - 1)
+        syncGrid()
+    }
+
+    // Mirror the published track grid into the lock-guarded snapshot the sequencer reads.
+    // Call on main after any tracks mutation.
+    private func syncGrid() {
+        stateLock.lock()
+        gridSnapshot = tracks.map { ($0.id, $0.steps) }
+        stateLock.unlock()
     }
 
     // MARK: - Recording
 
     func startRecording() {
-        guard !isRecording, !isScrubbing else { return }
+        guard !isRecording else { return }
         #if os(iOS)
         let perm = AVAudioSession.sharedInstance().recordPermission
         if perm == .undetermined {
@@ -781,42 +807,160 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         }
         guard perm == .granted else { return }
         #endif
+        guard tracks.indices.contains(armedTrack) else { return }
 
-        if !isPlaying && !samples.isEmpty { resumePlayback() }
-        startEngineIfNeeded()
-        captureStartPos = ringWritePos    // mark start position after engine is up
-        // Compute phase directly from the clock rather than the 60fps timer value,
-        // which can be up to ~17ms stale — enough to cause audible timing offset on overdubs.
-        if let start = loopStartDate, let dur = loopDuration, dur > 0 {
-            recordingPhase = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
-        } else {
-            recordingPhase = 0.0
+        // Tapping record during an active count-in cancels it.
+        if isCountingIn {
+            cancelCountIn()
+            return
         }
-        isRecording     = true
+        if countInEnabled {
+            beginCountIn()
+            return
+        }
+        performStartRecording()
+    }
+
+    // MARK: - Count-in
+
+    func toggleCountIn() {
+        countInEnabled.toggle()
+        if !countInEnabled, isCountingIn { cancelCountIn() }
+    }
+
+    func cancelCountIn() {
+        isCountingIn = false
+        countInBeat  = 0
+        seqQueue.async { [weak self] in
+            self?.countActive = false
+            self?.countTimer?.cancel()
+            self?.countTimer = nil
+        }
+    }
+
+    private func beginCountIn() {
+        isCountingIn = true
+        countInBeat  = 4
+        startEngineIfNeeded()
+        seqQueue.async { [weak self] in
+            guard let self else { return }
+            self.countActive    = true
+            self.countRemaining = 4
+            self.countDeadline  = .now()
+            self.countTick()
+        }
+    }
+
+    // One bar of 4/4 at the current tempo, then recording starts for real.
+    private func countTick() {
+        guard countActive else {
+            countTimer?.cancel(); countTimer = nil
+            return
+        }
+        if countRemaining == 0 {
+            countActive = false
+            countTimer?.cancel(); countTimer = nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCountingIn else { return }
+                self.isCountingIn = false
+                self.countInBeat  = 0
+                self.performStartRecording()
+            }
+            return
+        }
+
+        playClick(downbeat: countRemaining == 4)
+        let beat = countRemaining
+        DispatchQueue.main.async { [weak self] in self?.countInBeat = beat }
+        countRemaining -= 1
+
+        stateLock.lock()
+        let interval = 60.0 / bpmValue
+        stateLock.unlock()
+        countDeadline = countDeadline + interval
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: seqQueue)
+        timer.schedule(deadline: countDeadline, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.countTick() }
+        timer.resume()
+        countTimer = timer
+    }
+
+    private func performStartRecording() {
+        guard !isRecording, tracks.indices.contains(armedTrack) else { return }
+        startEngineIfNeeded()
+        recordTrackID = tracks[armedTrack].id
+
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        let capSR   = captureFormat?.sampleRate ?? session.sampleRate
+        let inLat   = session.inputLatency
+        let outLat  = session.outputLatency
+        let ioBuf   = session.ioBufferDuration
+        #else
+        let capSR   = captureFormat?.sampleRate ?? 48_000
+        let inLat:  TimeInterval = 0
+        let outLat: TimeInterval = 0
+        let ioBuf:  TimeInterval = 0
+        #endif
+
+        if isPlaying {
+            // Quantize into the grid: snap the start to the nearest 16th step.
+            // The user taps in response to audio they heard outputLatency ago, so judge
+            // their timing against the perceived tap time, not the wall clock.
+            stateLock.lock()
+            let stepDate = lastStepDate
+            let stepIdx  = lastStepIndex
+            let interval = stepInterval
+            stateLock.unlock()
+
+            let perceived = Date().addingTimeInterval(-outLat)
+            let fracPos   = Double(stepIdx) + perceived.timeIntervalSince(stepDate) / interval
+            let nearest   = Int(round(fracPos))
+            recordStartStep = ((nearest % Self.stepCount) + Self.stepCount) % Self.stepCount
+
+            // deltaSec > 0 → tap landed after the boundary: back-date the capture so it
+            // begins exactly at the step (the ring buffer holds the past). deltaSec < 0 →
+            // boundary is ahead: capture starts in the (near) future.
+            // (inLat + ioBuf) shifts ringWritePos to the ring position of "now".
+            let deltaSec = (fracPos - Double(nearest)) * interval
+            captureStartPos = ringWritePos + Int(((inLat + ioBuf) - deltaSec) * max(capSR, 1.0))
+            outCaptureStart = outWritePos - Int(deltaSec * max(outSampleRate, 0))
+        } else {
+            recordStartStep = nil
+            captureStartPos = ringWritePos
+            outCaptureStart = outWritePos
+        }
+
+        isRecording = true
         updatePlaybackVolume()
-        log.info("startRecording: tapInstalled=\(self.inputTapInstalled) captureStart=\(self.captureStartPos) ringWrite=\(self.ringWritePos)")
+        log.info("startRecording: track=\(self.armedTrack) step=\(self.recordStartStep.map(String.init) ?? "-") inLat=\(inLat * 1000)ms outLat=\(outLat * 1000)ms ioBuf=\(ioBuf * 1000)ms capSR=\(capSR) captureStart=\(self.captureStartPos) ringWrite=\(self.ringWritePos)")
     }
 
     func stopRecording() {
         guard isRecording else { return }
-        let endPos = ringWritePos         // snapshot before any further audio arrives
+        let endPos    = ringWritePos      // snapshot before any further audio arrives
+        let outEndPos = outWritePos
         isRecording = false
         updatePlaybackVolume()
 
-        let isFirst       = !hasAnyLoop
-        if isFirst { hasAnyLoop = true }
-        let capturedPhase = isFirst ? 0.0 : recordingPhase
-        let start         = captureStartPos
+        let trackID   = recordTrackID
+        let startStep = recordStartStep
+        let start     = captureStartPos
+        let outStart  = outCaptureStart
+        recordTrackID   = nil
+        recordStartStep = nil
         log.info("stopRecording: frames=\(endPos - start) tapInstalled=\(self.inputTapInstalled) captureFmt sr=\(self.captureFormat?.sampleRate ?? 0)")
 
-        guard let buf = drainRingBuffer(from: start, to: endPos) else {
-            log.error("stopRecording: drainRingBuffer returned nil (frames=\(endPos - start), captureFormat=\(String(describing: self.captureFormat)))")
-            if isFirst { hasAnyLoop = false }
+        guard let trackID, let buf = drainRingBuffer(from: start, to: endPos) else {
+            log.error("stopRecording: drainRingBuffer returned nil (frames=\(endPos - start))")
             return
         }
 
+        // Resampling: fold live-triggered playback (track submix) into the take.
+        mixOutputIntoBuffer(buf, outStart: outStart, outEnd: outEndPos)
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.processSampleBuffer(buf, capturedPhase: capturedPhase, isFirst: isFirst)
+            self?.processRecordedBuffer(buf, trackID: trackID, startStep: startStep)
         }
     }
 
@@ -846,69 +990,46 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         return buf
     }
 
-    // MARK: - Sample processing (in-memory, no file read)
+    // MARK: - Sample processing (in-memory, no file round-trip)
 
-    private func processSampleBuffer(_ rawBuf: AVAudioPCMBuffer, capturedPhase: Double, isFirst: Bool) {
-        let buf    = trimEndSilence(rawBuf) ?? rawBuf
-        let rawDur = Double(buf.frameLength) / buf.format.sampleRate
-
-        // Write CAF for cleanup reference (undo/clear); not on the critical path
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let url = dir.appendingPathComponent("s-\(UUID().uuidString.prefix(8)).caf")
-        if let f = try? AVAudioFile(forWriting: url, settings: buf.format.settings) {
-            try? f.write(from: buf)
-        }
-
-        var finalBuf = buf
-        var finalDur = rawDur
-
-        if !isFirst, let current = loopDuration {
-            let targetFrames = AVAudioFrameCount(current * buf.format.sampleRate)
-            if targetFrames <= buf.frameLength {
-                buf.frameLength = targetFrames
-                finalDur = current
-            } else {
-                finalBuf = padBuffer(buf, toDuration: current) ?? buf
-                finalDur = current
-            }
-        }
-
-        let sample = Sample(url: url, duration: finalDur, naturalDuration: rawDur, phaseOffset: capturedPhase)
-        let node   = AVAudioPlayerNode()
+    private func processRecordedBuffer(_ rawBuf: AVAudioPCMBuffer, trackID: UUID, startStep: Int?) {
+        let buf = trimEndSilence(rawBuf) ?? rawBuf
+        let dur = Double(buf.frameLength) / buf.format.sampleRate
+        let node = AVAudioPlayerNode()
 
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            // Attach / connect / start must happen on main — keep engine ops off background threads.
+            guard let self, let idx = self.tracks.firstIndex(where: { $0.id == trackID }) else { return }
+
+            // Recording replaces the track's sample: swap out the old node entirely
+            // (the new buffer's format may differ if the route changed mid-session).
+            self.stateLock.lock()
+            if let old = self.playerNodes[trackID] {
+                old.stop()
+                self.audioEngine.detach(old)
+            }
+            self.stateLock.unlock()
+
             self.audioEngine.attach(node)
-            self.audioEngine.connect(node, to: self.audioEngine.mainMixerNode, format: finalBuf.format)
+            self.audioEngine.connect(node, to: self.trackMixer, format: buf.format)
             self.startEngineIfNeeded()
 
-            if isFirst {
-                self.loopDuration   = finalDur
-                self.loopStartDate  = Date()
-                self.pausedPosition = 0
+            self.stateLock.lock()
+            self.playerNodes[trackID] = node
+            self.sampleBufs[trackID]  = buf
+            self.stateLock.unlock()
+
+            self.tracks[idx].hasSample      = true
+            self.tracks[idx].sampleDuration = dur
+
+            if let s = startStep {
+                // Recorded live: drop the sample into the grid at the quantized step.
+                self.tracks[idx].steps[s] = true
+            } else if !self.tracks[idx].steps.contains(true) {
+                // Recorded while paused into an empty row: default to the downbeat
+                // so hitting play makes sound.
+                self.tracks[idx].steps[0] = true
             }
-
-            self.playerNodes[sample.id] = node
-            self.sampleBufs[sample.id]  = finalBuf
-            self.samples.append(sample)
-
-            let currentPos: Double
-            if let start = self.loopStartDate, let dur = self.loopDuration, dur > 0 {
-                currentPos = Date().timeIntervalSince(start).truncatingRemainder(dividingBy: dur) / dur
-            } else {
-                currentPos = self.pausedPosition
-            }
-
-            let distance    = (currentPos - capturedPhase + 1.0).truncatingRemainder(dividingBy: 1.0)
-            let totalFrames = finalBuf.frameLength
-            let frameOffset = AVAudioFrameCount(distance * Double(totalFrames))
-            let tailFrames  = totalFrames > frameOffset ? totalFrames - frameOffset : 0
-
-            self.scheduleFromOffset(node: node, buf: finalBuf,
-                                    frameOffset: frameOffset, tailFrames: tailFrames)
-            node.play()
-            self.beginLoop()
+            self.syncGrid()
         }
     }
 
@@ -934,24 +1055,4 @@ final class JammyEngine: ObservableObject, @unchecked Sendable {
         }
         return out
     }
-
-    private func padBuffer(_ buf: AVAudioPCMBuffer, toDuration dur: TimeInterval) -> AVAudioPCMBuffer? {
-        let targetFrames = AVAudioFrameCount(dur * buf.format.sampleRate)
-        guard targetFrames > buf.frameLength,
-              let padded = AVAudioPCMBuffer(pcmFormat: buf.format, frameCapacity: targetFrames),
-              let src    = buf.floatChannelData,
-              let dst    = padded.floatChannelData
-        else { return buf }
-        padded.frameLength = targetFrames
-        let channels  = Int(buf.format.channelCount)
-        let srcFrames = Int(buf.frameLength)
-        let dstFrames = Int(targetFrames)
-        for c in 0..<channels {
-            memcpy(dst[c], src[c], srcFrames * MemoryLayout<Float>.size)
-            memset(dst[c].advanced(by: srcFrames), 0,
-                   (dstFrames - srcFrames) * MemoryLayout<Float>.size)
-        }
-        return padded
-    }
 }
-
