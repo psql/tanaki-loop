@@ -26,13 +26,22 @@ private let padGap:     CGFloat = 8
 private let cellGap:    CGFloat = 2.5
 private let beatGap:    CGFloat = 5
 private let rowGap:     CGFloat = 7
-private let trackRowH:  CGFloat = 40
+private let trackRowMax: CGFloat = 40   // portrait cap
+private let trackRowMin: CGFloat = 15   // landscape floor
+private let pageIndicatorH: CGFloat = 30
+private let gridVSpacing:   CGFloat = 12
 private let recordDiam: CGFloat = 120
 
 // MARK: - ContentView
 
 struct ContentView: View {
     @StateObject private var engine = LoopEngine()
+    #if os(iOS)
+    @Environment(\.verticalSizeClass) private var vSizeClass
+    private var isLandscape: Bool { vSizeClass == .compact }
+    #else
+    private var isLandscape: Bool { false }
+    #endif
 
     // Record button gesture state (Keezy: hold = record while held, tap = latch)
     @State private var btnPressed   = false
@@ -83,15 +92,14 @@ struct ContentView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
 
-                Spacer(minLength: 16)
-
+                // Grid fills the space between the bars; its rows size to fit so the
+                // layout stays friendly in landscape (short) as well as portrait.
                 grid
                     .padding(.horizontal, 12)
-
-                Spacer(minLength: 16)
+                    .frame(maxHeight: .infinity)
 
                 bottomBar
-                    .padding(.bottom, 28)
+                    .padding(.bottom, isLandscape ? 12 : 28)
             }
 
             if showTapTempo {
@@ -686,30 +694,29 @@ struct ContentView: View {
     private var grid: some View {
         GeometryReader { geo in
             let W = geo.size.width
+            // Size rows to the available height so 8 rows + the page indicator always fit
+            // (capped at trackRowMax so portrait rows don't get huge). No ScrollView —
+            // its pan recognizer steals the horizontal pager drag.
+            let rows = CGFloat(LoopEngine.maxTracks)
+            let avail = geo.size.height - pageIndicatorH - gridVSpacing - 12
+            let rowH = min(trackRowMax, max(trackRowMin, (avail - rowGap * (rows - 1)) / rows))
 
-            // No ScrollView here on purpose: its pan recognizer steals the horizontal
-            // pager drag. All 8 rows + controls fit on screen without scrolling.
-            VStack(spacing: 14) {
-                barPager(W: W)
-                    .padding(.vertical, 6)
-
+            VStack(spacing: gridVSpacing) {
+                Spacer(minLength: 0)
+                barPager(W: W, rowH: rowH)
                 pageIndicator
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxHeight: gridMaxHeight)
-    }
-
-    private var gridMaxHeight: CGFloat {
-        let rows = CGFloat(engine.tracks.count)
-        return rows * trackRowH + (rows - 1) * rowGap + 12 + 58
     }
 
     // MARK: - Bar pager
 
-    private func barPager(W: CGFloat) -> some View {
+    private func barPager(W: CGFloat, rowH: CGFloat) -> some View {
         HStack(alignment: .top, spacing: 0) {
             ForEach(0..<engine.barCount, id: \.self) { bar in
-                barPage(bar: bar, W: W)
+                barPage(bar: bar, W: W, rowH: rowH)
                     .frame(width: W)
             }
         }
@@ -719,7 +726,7 @@ struct ContentView: View {
         .simultaneousGesture(pageDragGesture(W: W))
     }
 
-    private func barPage(bar: Int, W: CGFloat) -> some View {
+    private func barPage(bar: Int, W: CGFloat, rowH: CGFloat) -> some View {
         let cells        = LoopEngine.stepCount / displayRes
         let cellsPerBeat = max(1, 4 / displayRes)
         let cellW        = (W - padWidth - padGap - cellGap * CGFloat(cells - 1)
@@ -728,7 +735,7 @@ struct ContentView: View {
         return VStack(spacing: rowGap) {
             ForEach(Array(engine.tracks.enumerated()), id: \.element.id) { ti, track in
                 trackRow(ti: ti, track: track, bar: bar,
-                         cells: cells, cellsPerBeat: cellsPerBeat, cellW: cellW, rowH: trackRowH)
+                         cells: cells, cellsPerBeat: cellsPerBeat, cellW: cellW, rowH: rowH)
             }
         }
     }
