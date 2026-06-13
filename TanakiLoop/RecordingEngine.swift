@@ -43,6 +43,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     @Published private(set) var currentStep:   Int     = 0    // 0..<16, within the playing bar
     @Published private(set) var currentBar:    Int     = 0
     @Published private(set) var barCount:      Int     = 1
+    @Published private(set) var loopedBar:     Int?    = nil   // when set, only this bar plays
     @Published private(set) var bpm:           Double  = 120
     @Published private(set) var armedTrack:    Int     = 0
     @Published private(set) var fftMagnitudes: [Float] = [Float](repeating: 0, count: 64)
@@ -83,6 +84,7 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     private var nextStepIndex: Int = 0          // global: 0..<(stepCount * bars)
     private var bpmValue:      Double = 120
     private var barsValue:     Int = 1
+    private var loopedBarValue: Int = -1        // -1 = play all bars; else confine to this bar
     private var gridSnapshot:  [(id: UUID, steps: [[Bool]])] = []
     private var lastStepDate:  Date = .distantPast
     private var lastStepIndex: Int = 0          // global index
@@ -706,10 +708,14 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
     private func tick() {
         stateLock.lock()
         guard seqRunning else { stateLock.unlock(); return }
-        let total    = Self.stepCount * max(1, barsValue)
-        let global   = nextStepIndex % total
-        let bar      = global / Self.stepCount
-        let stepIdx  = global % Self.stepCount
+        let bars     = max(1, barsValue)
+        let total    = Self.stepCount * bars
+        let loop     = loopedBarValue
+        let useLoop  = loop >= 0 && loop < bars
+        // In loop mode the bar is pinned and only the 16th step advances inside it.
+        let stepIdx  = nextStepIndex % Self.stepCount
+        let bar      = useLoop ? loop : (nextStepIndex % total) / Self.stepCount
+        let global   = bar * Self.stepCount + stepIdx
         let snapshot = gridSnapshot
         let metroOn  = metronomeEnabled
         for (id, steps) in snapshot where bar < steps.count && steps[bar][stepIdx] {
@@ -717,7 +723,9 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         }
         lastStepDate  = Date()
         lastStepIndex = global
-        nextStepIndex = (global + 1) % total
+        nextStepIndex = useLoop
+            ? loop * Self.stepCount + ((stepIdx + 1) % Self.stepCount)
+            : (global + 1) % total
         let interval  = stepInterval
         stateLock.unlock()
 
@@ -875,7 +883,18 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
             tracks[i].steps.remove(at: index)
         }
         barCount -= 1
+        // Keep any single-bar loop pointing at a valid bar (or clear it).
+        if let lb = loopedBar, lb >= barCount { setLoopedBar(barCount - 1) }
         syncGrid()
+    }
+
+    // Single-bar loop: pass a bar index to confine playback to it, or nil to play all bars.
+    func setLoopedBar(_ bar: Int?) {
+        let b = (bar.map { (0..<barCount).contains($0) } ?? false) ? bar! : -1
+        loopedBar = b >= 0 ? b : nil
+        stateLock.lock()
+        loopedBarValue = b
+        stateLock.unlock()
     }
 
     // MARK: - Track management

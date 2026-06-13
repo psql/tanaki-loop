@@ -51,6 +51,7 @@ struct ContentView: View {
     // Bar paging
     @State private var viewedBar = 0
     @State private var pageDragX: CGFloat = 0
+    @State private var loopOn = false   // loop just the currently-viewed bar
 
     // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
     @State private var displayRes = 1
@@ -122,6 +123,10 @@ struct ContentView: View {
             // Undo can shrink the bar count out from under the pager
             if viewedBar > count - 1 { viewedBar = count - 1 }
         }
+        .onChange(of: viewedBar) { _, bar in
+            // Loop follows the page you're viewing while engaged
+            if loopOn { engine.setLoopedBar(bar) }
+        }
     }
 
     private var armedColor: Color {
@@ -164,6 +169,20 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .matchedGeometryEffect(id: "perfZui", in: zuiNS)
             }
+
+            // Loop just the bar you're looking at
+            Button {
+                loopOn.toggle()
+                engine.setLoopedBar(loopOn ? viewedBar : nil)
+                triggerHaptic(.light)
+            } label: {
+                Image(systemName: "repeat")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(loopOn ? armedColor : .white.opacity(0.35))
+                    .frame(width: 40, height: 56)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
 
             Spacer()
 
@@ -417,7 +436,7 @@ struct ContentView: View {
             }
         }
         #if os(iOS)
-        .onAppear { padHitHaptic.prepare() }   // first hit fires without warm-up lag
+        .onAppear { Haptics.shared.warmUp() }   // first hit fires without warm-up lag
         #endif
     }
 
@@ -478,8 +497,7 @@ struct ContentView: View {
                         if !pressedPads.contains(track.id) {
                             pressedPads.insert(track.id)
                             engine.selectTrack(ti)   // audio first — trigger on touch-down
-                            padHitHaptic.impactOccurred(intensity: 0.9)
-                            padHitHaptic.prepare()
+                            Haptics.shared.pulse(intensity: 0.9, sharpness: 0.6)
                         }
                         // Drag sideways to throw the tile away — tracks the finger 1:1
                         if abs(v.translation.width) > 14 {
@@ -611,8 +629,7 @@ struct ContentView: View {
         engine.setBPM(target)
         if Int(engine.bpm) != before {
             #if os(iOS)
-            bpmTickHaptic.selectionChanged()
-            bpmTickHaptic.prepare()
+            Haptics.shared.pulse(intensity: 0.4, sharpness: 0.6)
             #endif
         }
     }
@@ -697,14 +714,20 @@ struct ContentView: View {
         ZStack {
             HStack(spacing: 6) {
                 ForEach(0..<engine.barCount, id: \.self) { bar in
+                    let isLooped = loopOn && engine.loopedBar == bar
                     ZStack {
                         Circle()
-                            .fill(.white.opacity(bar == viewedBar ? 0.9 : 0.25))
+                            .fill(isLooped ? armedColor : .white.opacity(bar == viewedBar ? 0.9 : 0.25))
                             .frame(width: 7, height: 7)
                         if engine.isPlaying && engine.currentBar == bar {
                             Circle()
                                 .stroke(armedColor, lineWidth: 1.5)
                                 .frame(width: 13, height: 13)
+                        }
+                        if isLooped {
+                            Circle()
+                                .stroke(armedColor.opacity(0.5), lineWidth: 1)
+                                .frame(width: 16, height: 16)
                         }
                     }
                     .frame(width: 14, height: 14)
@@ -1047,58 +1070,73 @@ struct ContentView: View {
     private func triggerHaptic(_ weight: HapticWeight) {
         #if os(iOS)
         switch weight {
-        case .light: UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        case .heavy: UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        case .light: Haptics.shared.pulse(intensity: 0.6, sharpness: 0.45)
+        case .heavy: Haptics.shared.pulse(intensity: 1.0, sharpness: 0.7)
         }
         #endif
     }
 
     private func metronomeBuzz(downbeat: Bool) {
         #if os(iOS)
-        // Core Haptics rather than UIFeedbackGenerator: the latter is suppressed by the
-        // system while the mic is recording (exactly when you want the click), and is
-        // softer. A sharp transient at full intensity reads as a firm metronome tick.
         if downbeat {
-            metronomeHaptics.pulse(intensity: 1.0, sharpness: 0.9)
+            Haptics.shared.pulse(intensity: 1.0, sharpness: 0.9)
         } else {
-            metronomeHaptics.pulse(intensity: 0.65, sharpness: 0.55)
+            Haptics.shared.pulse(intensity: 0.65, sharpness: 0.55)
         }
         #endif
     }
 }
 
 #if os(iOS)
-// Long-lived, prepared generators — beat timing is too tight to recreate them per buzz.
-private let bpmTickHaptic = UISelectionFeedbackGenerator()
-private let padHitHaptic  = UIImpactFeedbackGenerator(style: .rigid)
-private let metronomeHaptics = HapticPulse()
+// All haptics route through one Core Haptics engine. UIFeedbackGenerator is silenced by
+// the system whenever the app's AVAudioSession is `.playAndRecord` and active (which is
+// always, here) — that's why nothing was buzzing. Core Haptics with playsHapticsOnly=true
+// does NOT touch the audio session, so it fires regardless of recording state.
+final class Haptics {
+    static let shared = Haptics()
 
-// Core Haptics transient player — strong, precisely-timed pulses that keep firing even
-// while an AVAudioSession recording is active (UIFeedbackGenerator does not).
-final class HapticPulse {
     private var engine: CHHapticEngine?
     private let supported = CHHapticEngine.capabilitiesForHardware().supportsHaptics
 
-    init() {
+    private init() {
         guard supported else { return }
-        engine = try? CHHapticEngine()
-        engine?.isAutoShutdownEnabled = true
-        engine?.resetHandler   = { [weak self] in try? self?.engine?.start() }
-        engine?.stoppedHandler = { _ in }
-        try? engine?.start()
+        do {
+            let e = try CHHapticEngine()
+            e.playsHapticsOnly = true          // don't fight the recording audio session
+            e.isAutoShutdownEnabled = false     // stay warm so beats land on time
+            e.resetHandler = { [weak self] in try? self?.engine?.start() }
+            e.stoppedHandler = { [weak self] _ in try? self?.engine?.start() }
+            try e.start()
+            engine = e
+        } catch {
+            engine = nil
+        }
+    }
+
+    func warmUp() {
+        guard supported, let engine else { return }
+        try? engine.start()
     }
 
     func pulse(intensity: Float, sharpness: Float) {
-        guard supported, let engine else { return }
+        guard supported, let engine else {
+            // No Core Haptics hardware — best-effort UIKit fallback.
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            return
+        }
         let params = [
             CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
             CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness),
         ]
         let event = CHHapticEvent(eventType: .hapticTransient, parameters: params, relativeTime: 0)
-        guard let pattern = try? CHHapticPattern(events: [event], parameters: []),
-              let player  = try? engine.makePlayer(with: pattern) else { return }
-        try? engine.start()          // no-op if already running; wakes it after autoshutdown
-        try? player.start(atTime: CHHapticTimeImmediate)
+        do {
+            try engine.start()   // no-op if already running
+            let pattern = try CHHapticPattern(events: [event], parameters: [])
+            let player  = try engine.makePlayer(with: pattern)
+            try player.start(atTime: CHHapticTimeImmediate)
+        } catch {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
     }
 }
 #endif
