@@ -53,7 +53,6 @@ struct ContentView: View {
 
     // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
     @State private var displayRes = 1
-    @State private var resPinchFired = false
 
     var body: some View {
         ZStack {
@@ -129,22 +128,6 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
 
-            Button {
-                engine.toggleMetronome()
-                triggerHaptic(.light)
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color(red: 0.18, green: 0.18, blue: 0.22)
-                            .opacity(engine.metronomeOn ? 1.0 : 0.55))
-                    Image(systemName: "metronome.fill")
-                        .font(.system(size: 19, weight: .semibold))
-                        .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.35))
-                }
-                .frame(width: 56, height: 56)
-            }
-            .buttonStyle(.plain)
-
             // Live input meter, toolbar-sized
             SpectrogramView(bins: engine.fftMagnitudes, isRecording: engine.isRecording)
                 .frame(height: 44)
@@ -157,7 +140,20 @@ struct ContentView: View {
     }
 
     private var bpmControl: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
+            // Metronome lives with the tempo controls
+            Button {
+                engine.toggleMetronome()
+                triggerHaptic(.light)
+            } label: {
+                Image(systemName: "metronome.fill")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.35))
+                    .frame(width: 40, height: 56)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
             HoldRepeatButton(systemName: "minus") { step in nudgeBPM(-step) }
 
             if showTapTempo {
@@ -351,7 +347,6 @@ struct ContentView: View {
         .offset(x: -CGFloat(viewedBar) * W + pageDragX)
         .contentShape(Rectangle())
         .simultaneousGesture(pageDragGesture(W: W))
-        .simultaneousGesture(resolutionPinch)
     }
 
     private func barPage(bar: Int, W: CGFloat) -> some View {
@@ -433,46 +428,87 @@ struct ContentView: View {
             }
     }
 
-    private var resolutionPinch: some Gesture {
-        MagnificationGesture()
-            .onChanged { value in
-                guard !resPinchFired else { return }
-                if value > 1.35, displayRes > 1 {
-                    // Pinch out → zoom in → finer grid
-                    resPinchFired = true
-                    triggerHaptic(.light)
-                    withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { displayRes /= 2 }
-                } else if value < 0.72, displayRes < 4 {
-                    // Pinch in → zoom out → coarser grid (16ths preserved underneath)
-                    resPinchFired = true
-                    triggerHaptic(.light)
-                    withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { displayRes *= 2 }
-                }
-            }
-            .onEnded { _ in resPinchFired = false }
-    }
-
+    // Dots centered; grid-resolution zoom on the left, delete-viewed-bar on the right.
     private var pageIndicator: some View {
-        HStack(spacing: 6) {
-            ForEach(0..<engine.barCount, id: \.self) { bar in
-                ZStack {
-                    Circle()
-                        .fill(.white.opacity(bar == viewedBar ? 0.9 : 0.25))
-                        .frame(width: 7, height: 7)
-                    if engine.isPlaying && engine.currentBar == bar {
+        ZStack {
+            HStack(spacing: 6) {
+                ForEach(0..<engine.barCount, id: \.self) { bar in
+                    ZStack {
                         Circle()
-                            .stroke(armedColor, lineWidth: 1.5)
-                            .frame(width: 13, height: 13)
+                            .fill(.white.opacity(bar == viewedBar ? 0.9 : 0.25))
+                            .frame(width: 7, height: 7)
+                        if engine.isPlaying && engine.currentBar == bar {
+                            Circle()
+                                .stroke(armedColor, lineWidth: 1.5)
+                                .frame(width: 13, height: 13)
+                        }
+                    }
+                    .frame(width: 18, height: 18)
+                    .contentShape(Circle().scale(1.8))
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { viewedBar = bar }
                     }
                 }
-                .frame(width: 18, height: 18)
-                .contentShape(Circle().scale(1.8))
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { viewedBar = bar }
-                }
+            }
+            .frame(maxWidth: .infinity)
+
+            HStack {
+                zoomControl
+                Spacer()
+                deleteBarButton
             }
         }
-        .frame(maxWidth: .infinity)
+    }
+
+    private var zoomControl: some View {
+        HStack(spacing: 0) {
+            zoomButton(systemName: "minus.magnifyingglass", enabled: displayRes < 4) {
+                displayRes *= 2
+            }
+            Text("1/\(LoopEngine.stepCount / displayRes)")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.45))
+                .frame(width: 28)
+                .monospacedDigit()
+            zoomButton(systemName: "plus.magnifyingglass", enabled: displayRes > 1) {
+                displayRes /= 2
+            }
+        }
+    }
+
+    private func zoomButton(systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            triggerHaptic(.light)
+            withAnimation(.spring(response: 0.30, dampingFraction: 0.8)) { action() }
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white.opacity(enabled ? 0.6 : 0.18))
+                .frame(width: 34, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
+    private var deleteBarButton: some View {
+        Button {
+            triggerHaptic(.heavy)
+            let bar = viewedBar
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                if viewedBar > 0 { viewedBar -= 1 }
+                engine.removeBar(bar)
+            }
+        } label: {
+            Image(systemName: "minus.circle")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.55))
+                .frame(width: 38, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(engine.barCount > 1 ? 1 : 0)
+        .disabled(engine.barCount <= 1)
     }
 
     private func trackRow(ti: Int, track: Track, bar: Int,

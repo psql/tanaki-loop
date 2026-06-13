@@ -852,6 +852,16 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         syncGrid()
     }
 
+    func removeBar(_ index: Int) {
+        guard barCount > 1, (0..<barCount).contains(index) else { return }
+        pushUndo()
+        for i in tracks.indices {
+            tracks[i].steps.remove(at: index)
+        }
+        barCount -= 1
+        syncGrid()
+    }
+
     // MARK: - Track management
 
     private var nextColorIndex = 2   // first two are taken by the initial tracks
