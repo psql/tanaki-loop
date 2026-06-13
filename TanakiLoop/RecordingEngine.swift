@@ -888,6 +888,10 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         syncGrid()
     }
 
+    // The bar the UI is currently showing — where paused recordings drop their default trigger.
+    var editingBar: Int = 0
+    func setEditingBar(_ bar: Int) { editingBar = max(0, bar) }
+
     // Single-bar loop: pass a bar index to confine playback to it, or nil to play all bars.
     func setLoopedBar(_ bar: Int?) {
         let b = (bar.map { (0..<barCount).contains($0) } ?? false) ? bar! : -1
@@ -967,7 +971,9 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
             cancelCountIn()
             return
         }
-        if countInEnabled {
+        // Count-in only makes sense from a stopped transport — when already playing you can
+        // hear the beat, so recording quantizes immediately against the running clock.
+        if countInEnabled && !isPlaying {
             beginCountIn()
             return
         }
@@ -985,9 +991,15 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         isCountingIn = false
         countInBeat  = 0
         seqQueue.async { [weak self] in
-            self?.countActive = false
-            self?.countTimer?.cancel()
-            self?.countTimer = nil
+            guard let self else { return }
+            self.countActive = false
+            self.countTimer?.cancel()
+            self.countTimer = nil
+            // Count-in aborted — bring the standalone metronome back if it was suppressed.
+            self.stateLock.lock()
+            let resume = self.metronomeEnabled && !self.seqRunning
+            self.stateLock.unlock()
+            if resume { self.startStandaloneMetronomeOnSeqQueue() }
         }
     }
 
@@ -997,6 +1009,10 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         startEngineIfNeeded()
         seqQueue.async { [weak self] in
             guard let self else { return }
+            // The count-in IS the metronome for this bar — suppress the standalone clock so
+            // they don't run on two different grids.
+            self.metroTimer?.cancel()
+            self.metroTimer = nil
             self.countActive    = true
             self.countRemaining = 4
             self.countDeadline  = .now()
@@ -1013,11 +1029,24 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
         if countRemaining == 0 {
             countActive = false
             countTimer?.cancel(); countTimer = nil
+            // The metronome must continue the exact same grid the count-in established: the
+            // next beat lands one interval after the last count, as a downbeat.
+            let handoffDeadline = countDeadline
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isCountingIn else { return }
                 self.isCountingIn = false
                 self.countInBeat  = 0
                 self.performStartRecording()
+                self.seqQueue.async {
+                    self.stateLock.lock()
+                    let resume = self.metronomeEnabled && !self.seqRunning
+                    self.stateLock.unlock()
+                    guard resume else { return }
+                    self.metroTimer?.cancel()
+                    self.metroBeatCount = 0
+                    self.metroDeadline  = handoffDeadline
+                    self.metroTick()
+                }
             }
             return
         }
@@ -1184,9 +1213,10 @@ final class LoopEngine: ObservableObject, @unchecked Sendable {
                     self.tracks[idx].steps[bar][step] = true
                 }
             } else if !self.tracks[idx].hasAnySteps {
-                // Recorded while paused into an empty row: default to the downbeat
-                // so hitting play makes sound.
-                self.tracks[idx].steps[0][0] = true
+                // Recorded while paused into an empty row: drop the default trigger on the
+                // downbeat of the bar the user is currently viewing (not always bar 0).
+                let bar = min(max(0, self.editingBar), self.barCount - 1)
+                self.tracks[idx].steps[bar][0] = true
             }
             self.syncGrid()
         }

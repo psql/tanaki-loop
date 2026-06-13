@@ -53,6 +53,10 @@ struct ContentView: View {
     @State private var pageDragX: CGFloat = 0
     @State private var loopOn = false   // loop just the currently-viewed bar
 
+    // Metronome visual flash (lets you see the tempo)
+    @State private var metroFlash: CGFloat = 0
+    @State private var metroFlashDownbeat = false
+
     // Grid resolution zoom (Ableton-style): 16th steps per displayed cell — 1, 2, or 4
     @State private var displayRes = 1
 
@@ -114,10 +118,12 @@ struct ContentView: View {
         .onChange(of: engine.metronomeBeat) { _, beat in
             guard engine.metronomeOn, beat >= 0 else { return }
             metronomeBuzz(downbeat: beat == 0)
+            flashMetronome(downbeat: beat == 0)
         }
         .onChange(of: engine.countInBeat) { _, beat in
             guard beat > 0 else { return }
             metronomeBuzz(downbeat: beat == 4)
+            flashMetronome(downbeat: beat == 4)
         }
         .onChange(of: engine.barCount) { _, count in
             // Undo can shrink the bar count out from under the pager
@@ -126,6 +132,7 @@ struct ContentView: View {
         .onChange(of: viewedBar) { _, bar in
             // Loop follows the page you're viewing while engaged
             if loopOn { engine.setLoopedBar(bar) }
+            engine.setEditingBar(bar)   // paused recordings land on the viewed bar
         }
     }
 
@@ -190,6 +197,16 @@ struct ContentView: View {
         }
     }
 
+    private var metronomeIconColor: Color {
+        guard engine.metronomeOn else { return .white.opacity(0.35) }
+        return armedColor.opacity(0.55 + 0.45 * Double(metroFlash))
+    }
+
+    private var metronomeIconScale: CGFloat {
+        let amount: CGFloat = metroFlashDownbeat ? 0.4 : 0.24
+        return 1 + metroFlash * amount
+    }
+
     private var bpmControl: some View {
         HStack(spacing: 4) {
             // Metronome lives with the tempo controls; long-hold opens its options
@@ -198,7 +215,9 @@ struct ContentView: View {
             } else {
                 Image(systemName: "metronome.fill")
                     .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(engine.metronomeOn ? armedColor : .white.opacity(0.35))
+                    .foregroundStyle(metronomeIconColor)
+                    .scaleEffect(metronomeIconScale)
+                    .brightness(Double(metroFlash) * 0.25)
                     .frame(width: 36, height: 56)
                     .contentShape(Rectangle())
                     .matchedGeometryEffect(id: "metroZui", in: zuiNS)
@@ -1084,6 +1103,13 @@ struct ContentView: View {
             Haptics.shared.pulse(intensity: 0.65, sharpness: 0.55)
         }
         #endif
+    }
+
+    // Visual beat flash on the metronome icon so the tempo is readable at a glance.
+    private func flashMetronome(downbeat: Bool) {
+        metroFlashDownbeat = downbeat
+        metroFlash = 1
+        withAnimation(.easeOut(duration: downbeat ? 0.30 : 0.22)) { metroFlash = 0 }
     }
 }
 
